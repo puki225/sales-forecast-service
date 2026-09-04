@@ -35,10 +35,14 @@ historically; this only projects the top-line number forward.
 
 ## Environment variables
 
-- `DATABASE_URL` - Postgres connection string. Same database `react-finance-dashboard`
-  uses; this service reads `v_sku_revenue`, `v_refunds_by_date`, `vat_divisor()`,
+- `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` - same database
+  `react-finance-dashboard` uses, and the same variable names its Node service's `Pool`
+  config reads (`server/index.js`) - copy the exact same values over from that service.
+  This service reads `v_sku_revenue`, `v_refunds_by_date`, `vat_divisor()`,
   `amazon_order_lines`/`amazon_orders`, `amazon_inventory_snapshots`, `sku_forecast_config`
-  and writes `sales_forecast` / `sales_forecast_exclusions`.
+  and writes `sales_forecast` / `sales_forecast_exclusions`. (A single `DATABASE_URL` is
+  also accepted if set, as an alternative - but this account's Railway services use the
+  five separate vars, not that.)
 - `API_KEY` - optional. If set, `POST /run` requires header `x-api-key: <API_KEY>`. If
   unset, the endpoint is open to anyone who has the URL (same opt-in convention as this
   repo's `Postgres-Access` proxy).
@@ -51,8 +55,8 @@ Standalone repo - deploys as its own Railway service, separate from
 Root Directory setting to worry about):
 
 1. In Railway, add a new service from this GitHub repo (`sales-forecast-service`).
-2. Set `DATABASE_URL` (same value as the dashboard's Node service) and, optionally,
-   `API_KEY`.
+2. Set `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER`/`DB_PASSWORD` (copy the exact values from
+   the dashboard's Node service) and, optionally, `API_KEY`.
 3. Deploy - Nixpacks auto-detects Python from `requirements.txt` and installs it
    correctly on its own; there's no custom `nixpacks.toml` here (an earlier one that
    pinned `nixPkgs = ["python311"]` without `pip` broke the build - Nixpacks' built-in
@@ -91,7 +95,7 @@ reads whatever `sales_forecast` currently holds, and shows `has_forecast: false`
 ```
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-DATABASE_URL=postgres://... uvicorn main:app --reload
+DB_HOST=... DB_PORT=5432 DB_NAME=... DB_USER=... DB_PASSWORD=... uvicorn main:app --reload
 ```
 
 `forecast.py` has no database dependency and can be exercised directly with a synthetic

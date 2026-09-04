@@ -11,8 +11,22 @@ import pandas as pd
 
 
 def get_connection():
-    dsn = os.environ["DATABASE_URL"]
-    return psycopg2.connect(dsn)
+    """Same connection convention as react-finance-dashboard/server/index.js's `Pool`
+    config: separate DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD vars, not a single
+    DATABASE_URL - that's simply what this account's Railway services use. sslmode
+    "require" (verify the channel is encrypted, don't verify the server cert) matches
+    that Pool's `ssl: { rejectUnauthorized: false }`. DATABASE_URL is accepted too, as a
+    convenience if a future service happens to set one instead - never required."""
+    if os.environ.get("DATABASE_URL"):
+        return psycopg2.connect(os.environ["DATABASE_URL"], sslmode="require")
+    return psycopg2.connect(
+        host=os.environ["DB_HOST"],
+        port=os.environ.get("DB_PORT", 5432),
+        dbname=os.environ["DB_NAME"],
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        sslmode="require",
+    )
 
 
 def fetch_daily_revenue(conn, min_date):
