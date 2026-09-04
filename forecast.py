@@ -156,6 +156,66 @@ def fit_ets(series, horizon, seasonal):
         return _flat_fallback(series, horizon, band_pct=0.3)
 
 
+# Minimum history for a PY (prior-year) blend to be trustworthy - one full year plus
+# enough slack either side to compute a trailing-56d growth factor and a centered PY
+# window near the very first comparison date.
+PY_MIN_HISTORY_DAYS = 380
+PY_TRAILING_DAYS = 56
+PY_SHIFT_DAYS = 364  # 52 whole weeks, not 365 - keeps weekday alignment intact (same
+# reasoning PVM's period presets already use for their YoY comparisons).
+PY_WINDOW_DAYS = 3  # +/- days averaged around the matching PY date, to smooth single-day
+# noise out of the seasonal shape rather than reading one PY Tuesday too literally.
+PY_GROWTH_FACTOR_BOUNDS = (0.3, 3.0)  # guards against a near-zero PY trailing window
+# (or a genuine outlier week) implying an absurd multiplier.
+
+
+def py_naive_forecast(series, horizon):
+    """Prior-year seasonal shape (same calendar dates 364 days back, centered 7-day
+    average to smooth noise) scaled by this year's trailing-56d vs PY's same-56d growth
+    factor. Returns (point array, True) or (None, False) if there isn't a full PY of
+    history yet. This is what actually carries seasonality forward past the point a
+    damped-trend ETS fit has flattened out - ETS's trend decays toward zero by design, so
+    on its own it never reproduces a real yearly cycle (a Christmas bump, a summer dip),
+    no matter how much history it's given."""
+    if len(series) < PY_MIN_HISTORY_DAYS:
+        return None, False
+    last_date = series.index[-1]
+    py_trailing_end = last_date - pd.Timedelta(days=PY_SHIFT_DAYS)
+    py_trailing_start = py_trailing_end - pd.Timedelta(days=PY_TRAILING_DAYS - 1)
+    py_trailing = series.loc[py_trailing_start:py_trailing_end].sum()
+    if py_trailing <= 0:
+        return None, False
+    this_trailing = series.iloc[-PY_TRAILING_DAYS:].sum()
+    growth_factor = np.clip(this_trailing / py_trailing, *PY_GROWTH_FACTOR_BOUNDS)
+
+    point = np.zeros(horizon)
+    for i in range(horizon):
+        target_date = last_date + timedelta(days=1 + i)
+        py_date = target_date - pd.Timedelta(days=PY_SHIFT_DAYS)
+        window = series.loc[py_date - pd.Timedelta(days=PY_WINDOW_DAYS): py_date + pd.Timedelta(days=PY_WINDOW_DAYS)]
+        py_val = float(window.mean()) if len(window) else 0.0
+        point[i] = max(0.0, py_val * growth_factor)
+    return point, True
+
+
+def blend_with_py(series, point, low, high, horizon):
+    """Recenters a stage-based fit's point estimate onto the PY-naive seasonal estimate
+    where PY history exists, ramping from "trust the fitted model" (day 1, real current
+    momentum) to "trust the PY shape" (day 28+, where a damped trend has already gone
+    flat and PY is the only remaining source of real signal) over the first 4 weeks.
+    Keeps the fitted model's own band WIDTH (uncertainty shouldn't shrink just because the
+    center moved) but recenters it on the blended point."""
+    py_point, has_py = py_naive_forecast(series, horizon)
+    if not has_py:
+        return point, low, high, False
+    ramp = np.clip(np.arange(horizon) / 28, 0, 1)
+    blended = ramp * py_point + (1 - ramp) * point
+    half_width = (high - low) / 2
+    blended_low = np.clip(blended - half_width, 0, None)
+    blended_high = blended + half_width
+    return blended, blended_low, blended_high, True
+
+
 def eol_forecast(daily_run_rate, depletion_days, horizon):
     """Sell at the current run rate until inventory (from the same velocity/sellable
     figures the Inventory tab uses) runs out, then stop - no restock assumed. Reflects the
@@ -187,6 +247,9 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
             point, low, high, model_used = fit_ets(cleaned, horizon, seasonal=True)
         else:  # growth, declining
             point, low, high, model_used = fit_ets(cleaned, horizon, seasonal=False)
+        point, low, high, blended = blend_with_py(cleaned, point, low, high, horizon)
+        if blended:
+            model_used += "+py_blend"
 
     generated_at = pd.Timestamp.utcnow()
     forecast_rows = [

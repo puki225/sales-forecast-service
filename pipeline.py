@@ -16,7 +16,9 @@ logger = logging.getLogger("forecast_pipeline")
 
 HISTORY_LOOKBACK_DAYS = 730  # 2 years - enough for a yearly-seasonal SKU, bounded so the
 # pull doesn't keep growing forever as more history accumulates.
-HORIZON_DAYS = 90  # covers the 30/60/90-day rollups the Sales Forecast tab shows.
+HORIZON_DAYS = 180  # ~6 months - a forecast is only actually useful at this range, per
+# the tab's own design discussion; the UI lets you view it at daily/weekly/monthly
+# granularity and doesn't force looking at all 180 raw daily points at once.
 
 
 def _eol_velocity(row):

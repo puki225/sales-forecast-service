@@ -17,14 +17,23 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
 2. **Strip outliers** - a local-median/MAD check flags genuine one-off spikes (Prime Day,
    a bulk order) and excludes them from the fit, recorded in `sales_forecast_exclusions`
    so the tab can show why.
-3. **Fit a model for that stage** and project 90 days forward:
+3. **Fit a model for that stage** and project 180 days (~6 months) forward:
    - `new` → logistic growth curve (S-shaped ramp toward a ceiling, not a straight line)
    - `growth` / `declining` → damped-trend ETS
    - `mature` / `plateau` → damped-trend ETS **with weekly seasonality**
    - **end-of-life** (checkbox on the tab) → no fitted curve at all: sell at the current
      run rate until FBA sellable stock runs out (same velocity math `/api/inventory` uses
      for its "days of inventory left"), then zero - no restock assumed.
-4. Writes `forecast_revenue` + an 80% interval (`low_revenue`/`high_revenue`) per day,
+4. **Blend with prior-year seasonality**, for any SKU with 380+ days of history (not
+   end-of-life): a damped trend flattens out by design over a 6-month horizon and never
+   reproduces a real yearly cycle (a Christmas bump, a summer dip) on its own, however
+   much history it's fitted on. This recenters the point estimate onto PY's same-date
+   revenue (7-day-smoothed, scaled by this year's trailing-56d vs PY's growth factor),
+   ramping from "trust the fitted model" (day 1) to "trust the PY shape" (day 28+). The
+   fitted model's own band width is kept, just recentered - `model_used` gets a
+   `+py_blend` suffix when this applied. Below 380 days of history, forecast stays purely
+   the stage-based fit from step 3.
+5. Writes `forecast_revenue` + an 80% interval (`low_revenue`/`high_revenue`) per day,
    replacing that SKU's previous forecast rows.
 
 A SKU with no sale in the last 180 days is skipped (dormant/delisted), unless the user has
