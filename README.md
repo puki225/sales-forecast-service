@@ -46,16 +46,19 @@ historically; this only projects the top-line number forward.
 
 ## Deploy (Railway)
 
-This lives inside the `react-finance-dashboard` repo but deploys as its **own** Railway
-service, separate from the dashboard's Node app:
+Standalone repo - deploys as its own Railway service, separate from
+`react-finance-dashboard`'s Node app (and the two live in different repos, so there's no
+Root Directory setting to worry about):
 
-1. In Railway, add a new service from this same GitHub repo.
-2. Set its **Root Directory** to `forecast-service` (Settings → Source) - this is what
-   scopes the build to this folder instead of the repo root.
-3. Set `DATABASE_URL` (same value as the dashboard's Node service) and, optionally,
+1. In Railway, add a new service from this GitHub repo (`sales-forecast-service`).
+2. Set `DATABASE_URL` (same value as the dashboard's Node service) and, optionally,
    `API_KEY`.
-4. Deploy. Confirm `GET https://<this-service>.up.railway.app/health` returns `{"ok":
-   true}`.
+3. Deploy - Nixpacks auto-detects Python from `requirements.txt` and installs it
+   correctly on its own; there's no custom `nixpacks.toml` here (an earlier one that
+   pinned `nixPkgs = ["python311"]` without `pip` broke the build - Nixpacks' built-in
+   Python provider gets this right without help, so it was just removed rather than
+   fixed forward).
+4. Confirm `GET https://<this-service>.up.railway.app/health` returns `{"ok": true}`.
 
 ## Triggering a run
 
