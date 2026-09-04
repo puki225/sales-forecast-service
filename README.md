@@ -33,8 +33,14 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
    fitted model's own band width is kept, just recentered - `model_used` gets a
    `+py_blend` suffix when this applied. Below 380 days of history, forecast stays purely
    the stage-based fit from step 3.
-5. Writes `forecast_revenue` + an 80% interval (`low_revenue`/`high_revenue`) per day,
-   replacing that SKU's previous forecast rows.
+5. Writes `forecast_revenue` + an uncertainty band (`low_revenue`/`high_revenue`) per day,
+   replacing that SKU's previous forecast rows. The band is deliberately tight near-term -
+   `0.75 × recent residual std`, widening by `sqrt(1 + days_out/45)` - so "tomorrow" reads
+   as mostly determined by actual recent volatility rather than a wide hedge, and only
+   opens up gradually further into the horizon. Every fit type (flat fallback, logistic,
+   ETS) uses this same formula; ETS's own prediction interval is intentionally not used
+   here, since it factors in parameter-estimation uncertainty on top of noise and ran
+   noticeably wider, especially for SKUs without much history.
 
 A SKU with no sale in the last 180 days is skipped (dormant/delisted), unless the user has
 explicitly configured it (an override or the end-of-life flag).

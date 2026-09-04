@@ -91,14 +91,37 @@ def _logistic(t, L, k, t0):
     return L / (1 + np.exp(-k * (t - t0)))
 
 
-def _flat_fallback(series, horizon, band_pct=0.25):
+# Single band formula used by every fit function below, replacing what used to be four
+# different ad-hoc widths (a flat % of the mean for the fallback, 1.28x residual std for
+# the logistic fit, and statsmodels' own prediction interval - which bakes in parameter-
+# estimation uncertainty on top of noise, and ran noticeably wider than the day-to-day
+# volatility alone would justify - for ETS). "Tomorrow" should read as tight and mostly
+# determined by recent actuals; the band's job is to show realistic near-term noise, not
+# hedge against every possible outcome, and to widen only gradually from there.
+BAND_Z = 0.75  # multiple of the residual std - deliberately tighter than a textbook
+# 80/90% interval, since the point estimate already carries the recent trend/PY shape.
+BAND_RAMP_DAYS = 45  # width at day t scales by sqrt(1 + t/45): ~1.15x by day 7,
+# ~1.4x by day 45, ~2.2x by day 180 (end of a 6-month horizon).
+
+
+def _band(point, resid_std, horizon):
+    widen = np.sqrt(1 + np.arange(horizon) / BAND_RAMP_DAYS)
+    half = BAND_Z * resid_std * widen
+    low = np.clip(point - half, 0, None)
+    high = point + half
+    return low, high
+
+
+def _flat_fallback(series, horizon):
     tail = series.iloc[-14:] if len(series) >= 1 else series
     base = float(tail.mean()) if len(tail) else 0.0
+    # Measured recent volatility, not a guessed percentage - self-calibrates per SKU (a
+    # steady seller gets a tight band, a spiky one gets a wider one) rather than assuming
+    # the same relative noise for every SKU regardless of how it actually behaves. Only
+    # falls back to a flat guess when there's truly too little data to measure noise from.
+    resid_std = float(tail.std()) if len(tail) > 1 else base * 0.15
     point = np.full(horizon, base)
-    band = base * band_pct
-    widen = np.sqrt(1 + np.arange(horizon) / 30)
-    low = np.clip(point - band * widen, 0, None)
-    high = point + band * widen
+    low, high = _band(point, resid_std, horizon)
     return point, low, high, "flat_fallback"
 
 
@@ -107,7 +130,7 @@ def fit_new(series, horizon):
     growth is naturally S-shaped (ramping toward a ceiling, not linear) - fit a logistic
     growth curve on a 7-day-smoothed series instead."""
     if len(series) < 10:
-        return _flat_fallback(series, horizon, band_pct=0.4)
+        return _flat_fallback(series, horizon)
     t = np.arange(len(series))
     y_smooth = series.rolling(7, min_periods=1, center=True).mean().values
     y_max = max(float(y_smooth.max()), 1.0)
@@ -121,12 +144,10 @@ def fit_new(series, horizon):
         t_future = np.arange(len(t), len(t) + horizon)
         point = _logistic(t_future, *popt)
         resid_std = float(np.std(series.values - _logistic(t, *popt)))
-        widen = np.sqrt(1 + np.arange(horizon) / 30)
-        low = np.clip(point - 1.28 * resid_std * widen, 0, None)
-        high = point + 1.28 * resid_std * widen
+        low, high = _band(point, resid_std, horizon)
         return point, low, high, "logistic_growth"
     except Exception:
-        return _flat_fallback(series, horizon, band_pct=0.4)
+        return _flat_fallback(series, horizon)
 
 
 def fit_ets(series, horizon, seasonal):
@@ -135,7 +156,10 @@ def fit_ets(series, horizon, seasonal):
     worth trusting, otherwise falls back to the non-seasonal damped-trend fit.
     ETSModel must be given the pandas Series (not .values) - get_prediction()'s
     summary_frame() reaches for the input's index internally and raises a bare
-    AttributeError against a plain ndarray."""
+    AttributeError against a plain ndarray. The band comes from _band() (in-sample
+    residual std), not statsmodels' own prediction interval - that interval includes
+    parameter-estimation uncertainty on top of noise and ran wide, especially for SKUs
+    without a long history to estimate the model's parameters confidently from."""
     n = len(series)
     use_seasonal = seasonal and n >= 21
     try:
@@ -145,15 +169,13 @@ def fit_ets(series, horizon, seasonal):
             seasonal_periods=7 if use_seasonal else None,
         )
         fit = model.fit(disp=False)
-        pred = fit.get_prediction(start=n, end=n + horizon - 1)
-        summary = pred.summary_frame(alpha=0.2)  # 80% interval
-        point = np.clip(summary["mean"].values, 0, None)
-        low = np.clip(summary["pi_lower"].values, 0, None)
-        high = np.clip(summary["pi_upper"].values, 0, None)
+        point = np.clip(fit.forecast(horizon).values, 0, None)
+        resid_std = float(fit.resid.std())
+        low, high = _band(point, resid_std, horizon)
         model_used = "ets_seasonal" if use_seasonal else "ets_damped_trend"
         return point, low, high, model_used
     except Exception:
-        return _flat_fallback(series, horizon, band_pct=0.3)
+        return _flat_fallback(series, horizon)
 
 
 # Minimum history for a PY (prior-year) blend to be trustworthy - one full year plus
