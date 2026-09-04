@@ -29,26 +29,24 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
    reproduces a real yearly cycle (a Christmas bump, a summer dip) on its own, however
    much history it's fitted on. This recenters the point estimate onto PY's same-date
    revenue (7-day-smoothed, scaled by this year's trailing-56d vs PY's growth factor),
-   ramping from "trust the fitted model" (day 1) to "trust the PY shape" (day 28+). The
-   fitted model's own band width is kept, just recentered - `model_used` gets a
-   `+py_blend` suffix when this applied. Below 380 days of history, forecast stays purely
-   the stage-based fit from step 3.
-5. **Texture the point forecast with daily noise** - `add_daily_noise()` adds i.i.d.
-   noise scaled to 0.7x the trailing actual day-to-day volatility (measured from
-   differenced daily values, so a steady trend doesn't get mistaken for noise), so the
-   forecast line reads as a plausible day-by-day sales path instead of a suspiciously
-   smooth curve. Not seeded - a fresh pattern every run, not an identical one every night.
-6. Writes `forecast_revenue` + an uncertainty band (`low_revenue`/`high_revenue`) per day,
-   replacing that SKU's previous forecast rows. The band (computed from the smooth
-   pre-noise point, so it represents trend uncertainty - the noisy point can and
-   occasionally does poke outside it, same as real daily actuals do against a trend line)
-   is deliberately tight near-term - `0.75 × recent residual std`, widening by
-   `sqrt(1 + days_out/45)` - so "tomorrow" reads as mostly determined by actual recent
-   volatility rather than a wide hedge, and only opens up gradually further into the
-   horizon. Every fit type (flat fallback, logistic, ETS) uses this same band formula;
-   ETS's own prediction interval is intentionally not used here, since it factors in
-   parameter-estimation uncertainty on top of noise and ran noticeably wider, especially
-   for SKUs without much history.
+   ramping from "trust the fitted model" (day 1) to "trust the PY shape" (day 28+).
+   `model_used` gets a `+py_blend` suffix when this applied. Below 380 days of history,
+   forecast stays purely the stage-based fit from step 3.
+5. **Texture the point forecast with daily noise**, then **compute the band from that
+   noisy point** - in that order. `_volatility()` measures the trailing actual day-to-day
+   volatility from differenced daily values (so a steady trend doesn't get mistaken for
+   noise); `add_daily_noise()` adds i.i.d. noise scaled to 0.7x that figure, so the line
+   reads as a plausible day-by-day sales path instead of a suspiciously smooth curve; not
+   seeded, a fresh pattern every run rather than an identical one every night.
+   `band_from_point()` then builds `low_revenue`/`high_revenue` as that *same* noisy point
+   ± `1.4 × volatility`, widening by `sqrt(1 + days_out/45)` - which makes `low <= point
+   <= high` a hard guarantee by construction (not just "usually true"), and gives the
+   band's own edges the same jagged, real-looking texture as the line, rather than a
+   smooth curve sitting under a jagged one. An earlier version computed the band from the
+   pre-noise point using each model's own residual std, which decoupled the two badly
+   enough that the noisy line routinely poked outside its own band.
+6. Writes `forecast_revenue` + that band per day, replacing that SKU's previous forecast
+   rows.
 
 A SKU with no sale in the last 180 days is skipped (dormant/delisted), unless the user has
 explicitly configured it (an override or the end-of-life flag).

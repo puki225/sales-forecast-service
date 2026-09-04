@@ -91,38 +91,10 @@ def _logistic(t, L, k, t0):
     return L / (1 + np.exp(-k * (t - t0)))
 
 
-# Single band formula used by every fit function below, replacing what used to be four
-# different ad-hoc widths (a flat % of the mean for the fallback, 1.28x residual std for
-# the logistic fit, and statsmodels' own prediction interval - which bakes in parameter-
-# estimation uncertainty on top of noise, and ran noticeably wider than the day-to-day
-# volatility alone would justify - for ETS). "Tomorrow" should read as tight and mostly
-# determined by recent actuals; the band's job is to show realistic near-term noise, not
-# hedge against every possible outcome, and to widen only gradually from there.
-BAND_Z = 0.75  # multiple of the residual std - deliberately tighter than a textbook
-# 80/90% interval, since the point estimate already carries the recent trend/PY shape.
-BAND_RAMP_DAYS = 45  # width at day t scales by sqrt(1 + t/45): ~1.15x by day 7,
-# ~1.4x by day 45, ~2.2x by day 180 (end of a 6-month horizon).
-
-
-def _band(point, resid_std, horizon):
-    widen = np.sqrt(1 + np.arange(horizon) / BAND_RAMP_DAYS)
-    half = BAND_Z * resid_std * widen
-    low = np.clip(point - half, 0, None)
-    high = point + half
-    return low, high
-
-
 def _flat_fallback(series, horizon):
     tail = series.iloc[-14:] if len(series) >= 1 else series
     base = float(tail.mean()) if len(tail) else 0.0
-    # Measured recent volatility, not a guessed percentage - self-calibrates per SKU (a
-    # steady seller gets a tight band, a spiky one gets a wider one) rather than assuming
-    # the same relative noise for every SKU regardless of how it actually behaves. Only
-    # falls back to a flat guess when there's truly too little data to measure noise from.
-    resid_std = float(tail.std()) if len(tail) > 1 else base * 0.15
-    point = np.full(horizon, base)
-    low, high = _band(point, resid_std, horizon)
-    return point, low, high, "flat_fallback"
+    return np.full(horizon, base), "flat_fallback"
 
 
 def fit_new(series, horizon):
@@ -143,9 +115,7 @@ def fit_new(series, horizon):
         )
         t_future = np.arange(len(t), len(t) + horizon)
         point = _logistic(t_future, *popt)
-        resid_std = float(np.std(series.values - _logistic(t, *popt)))
-        low, high = _band(point, resid_std, horizon)
-        return point, low, high, "logistic_growth"
+        return point, "logistic_growth"
     except Exception:
         return _flat_fallback(series, horizon)
 
@@ -156,10 +126,7 @@ def fit_ets(series, horizon, seasonal):
     worth trusting, otherwise falls back to the non-seasonal damped-trend fit.
     ETSModel must be given the pandas Series (not .values) - get_prediction()'s
     summary_frame() reaches for the input's index internally and raises a bare
-    AttributeError against a plain ndarray. The band comes from _band() (in-sample
-    residual std), not statsmodels' own prediction interval - that interval includes
-    parameter-estimation uncertainty on top of noise and ran wide, especially for SKUs
-    without a long history to estimate the model's parameters confidently from."""
+    AttributeError against a plain ndarray."""
     n = len(series)
     use_seasonal = seasonal and n >= 21
     try:
@@ -170,10 +137,8 @@ def fit_ets(series, horizon, seasonal):
         )
         fit = model.fit(disp=False)
         point = np.clip(fit.forecast(horizon).values, 0, None)
-        resid_std = float(fit.resid.std())
-        low, high = _band(point, resid_std, horizon)
         model_used = "ets_seasonal" if use_seasonal else "ets_damped_trend"
-        return point, low, high, model_used
+        return point, model_used
     except Exception:
         return _flat_fallback(series, horizon)
 
@@ -220,59 +185,80 @@ def py_naive_forecast(series, horizon):
     return point, True
 
 
-def blend_with_py(series, point, low, high, horizon):
+def blend_with_py(series, point, horizon):
     """Recenters a stage-based fit's point estimate onto the PY-naive seasonal estimate
     where PY history exists, ramping from "trust the fitted model" (day 1, real current
     momentum) to "trust the PY shape" (day 28+, where a damped trend has already gone
-    flat and PY is the only remaining source of real signal) over the first 4 weeks.
-    Keeps the fitted model's own band WIDTH (uncertainty shouldn't shrink just because the
-    center moved) but recenters it on the blended point."""
+    flat and PY is the only remaining source of real signal) over the first 4 weeks."""
     py_point, has_py = py_naive_forecast(series, horizon)
     if not has_py:
-        return point, low, high, False
+        return point, False
     ramp = np.clip(np.arange(horizon) / 28, 0, 1)
     blended = ramp * py_point + (1 - ramp) * point
-    half_width = (high - low) / 2
-    blended_low = np.clip(blended - half_width, 0, None)
-    blended_high = blended + half_width
-    return blended, blended_low, blended_high, True
+    return blended, True
 
 
-# Separate from BAND_* above on purpose: the band represents growing TREND uncertainty
-# over the horizon (widens with time), while day-to-day noise is a texture that doesn't
-# decay - a mature SKU is just as jumpy on day 150 as on day 1. Using the raw trailing
-# actual std, not a model's residual std: ETS's residual nets out the seasonal/trend
-# shape it just fitted, which understates the swings a viewer actually sees in the plotted
-# historical line - "the daily volatility you see in actuals" means the raw line, not
-# what's left over after the model explains most of it away.
-NOISE_FRACTION = 0.7  # "a bit of" that volatility, not full-strength
+# One volatility measure drives both the day-to-day noise texture AND the band width -
+# using two different figures (as an earlier version did: each model's own residual std
+# for the band, raw actual std for the noise) meant the band's width had no reliable
+# relationship to how much noise actually got added to the point, so the noisy line
+# routinely poked outside its own "uncertainty" band - backwards for something meant to
+# bound the forecast. Deriving both from the SAME number, and computing the band from the
+# POST-noise point (not the smooth pre-noise one), makes containment automatic instead of
+# probabilistic, and gives the band's own edges the same jagged, real-looking texture as
+# the line instead of a smooth curve sitting under a jagged one.
+NOISE_FRACTION = 0.7  # "a bit of" the measured volatility, not full-strength
 NOISE_WINDOW_DAYS = 28
+BAND_Z = 1.4  # multiple of that same volatility - bigger than NOISE_FRACTION so the band
+# comfortably contains a typical noise draw before the hard clip below even applies caps
+# it (roughly a 1.4/0.7 = 2x margin over one noise std, ~92% of individual noisy points
+# would land inside even without clipping - the clip is what makes it a hard 100%).
+BAND_RAMP_DAYS = 45  # width at day t scales by sqrt(1 + t/45): ~1.15x by day 7,
+# ~1.4x by day 45, ~2.2x by day 180 (end of a 6-month horizon).
 
 
-def add_daily_noise(point, actual_series, horizon):
-    """Textures a smooth point forecast with i.i.d. noise scaled to the trailing actual
-    daily std, so the forecast reads as a plausible day-by-day sales path instead of a
-    suspiciously tidy trend line. Not seeded - a fresh, independent pattern each run is
-    more honest than an identical one appearing every night.
-
-    Measures volatility from day-over-day DIFFERENCES, not the raw level std of the
-    window - a fast-ramping short series (e.g. a brand-new SKU trending hard upward over
-    just its first few weeks) has a raw level std dominated by the trend itself, not by
-    actual noise, which blew the injected noise up to many times the real day-to-day
-    variance. Differencing cancels out a steady trend and isolates the noise; dividing by
-    sqrt(2) undoes the variance-doubling that differencing two independent noise terms
-    introduces, recovering the per-day noise sigma."""
-    if horizon <= 0:
-        return point
-    tail = actual_series.iloc[-NOISE_WINDOW_DAYS:]
+def _volatility(series):
+    """Trailing actual day-to-day volatility, measured from DIFFERENCED daily values
+    (day[i] - day[i-1]), not the raw level std of the window - a fast-ramping short series
+    (e.g. a brand-new SKU trending hard upward over its first few weeks) has a raw level
+    std dominated by the trend itself, not by actual noise. Differencing cancels a steady
+    trend out and isolates the noise; dividing by sqrt(2) undoes the variance-doubling
+    that differencing two independent noise terms introduces, recovering the per-day
+    noise sigma. Returns 0.0 (no noise, no band) when there's too little data to measure
+    it from - never a guessed percentage."""
+    tail = series.iloc[-NOISE_WINDOW_DAYS:]
     if len(tail) < 3:
-        return point
+        return 0.0
     diffs = tail.diff().dropna()
-    std = float(diffs.std()) / np.sqrt(2) if len(diffs) > 1 else 0.0
-    if std <= 0 or not np.isfinite(std):
+    if len(diffs) < 2:
+        return 0.0
+    std = float(diffs.std()) / np.sqrt(2)
+    return std if np.isfinite(std) and std > 0 else 0.0
+
+
+def add_daily_noise(point, std, horizon):
+    """Textures a smooth point forecast with i.i.d. noise scaled to `std` (see
+    _volatility), so the forecast reads as a plausible day-by-day sales path instead of a
+    suspiciously tidy trend line. Not seeded - a fresh, independent pattern each run is
+    more honest than an identical one appearing every night."""
+    if horizon <= 0 or std <= 0:
         return point
     noise = np.random.default_rng().normal(0, std * NOISE_FRACTION, horizon)
     return np.clip(point + noise, 0, None)
+
+
+def band_from_point(point, std, horizon):
+    """The uncertainty band, computed FROM the (already noisy) point - not the other way
+    around - so low <= point <= high holds by construction, always, not just on average.
+    Widens gradually with horizon (BAND_RAMP_DAYS); the day-to-day texture that gives both
+    edges their jagged look comes along for free, since they're just `point` offset by a
+    slowly-changing half-width."""
+    widen = np.sqrt(1 + np.arange(horizon) / BAND_RAMP_DAYS)
+    half = max(BAND_Z * std, 1e-9) * widen  # half > 0 always, so low <= point <= high
+    # holds by construction below - no separate clamp needed to enforce it.
+    low = np.clip(point - half, 0, None)
+    high = point + half
+    return low, high
 
 
 def eol_forecast(daily_run_rate, depletion_days, horizon):
@@ -281,10 +267,7 @@ def eol_forecast(daily_run_rate, depletion_days, horizon):
     end-of-life checkbox on the Sales Forecast tab exactly, not a fitted curve."""
     days = np.arange(horizon)
     point = np.where(days < depletion_days, daily_run_rate, 0.0)
-    band = daily_run_rate * 0.15
-    low = np.where(days < depletion_days, np.clip(point - band, 0, None), 0.0)
-    high = np.where(days < depletion_days, point + band, 0.0)
-    return point, low, high, "eol_depletion"
+    return point, "eol_depletion"
 
 
 def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs, horizon=90):
@@ -296,24 +279,31 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
 
     if is_end_of_life and eol_inputs and eol_inputs.get("daily_velocity_units", 0) > 0:
         depletion_days = eol_inputs["sellable"] / eol_inputs["daily_velocity_units"]
-        point, low, high, model_used = eol_forecast(eol_inputs["daily_run_rate"], depletion_days, horizon)
-        point = add_daily_noise(point, series, horizon)
-        # Noise must not leak past the hard sell-out cutoff - once inventory is gone,
-        # revenue is exactly 0, not a small random wobble around 0.
-        point = np.where(np.arange(horizon) < depletion_days, point, 0.0)
+        point, model_used = eol_forecast(eol_inputs["daily_run_rate"], depletion_days, horizon)
+        std = _volatility(series)
+        point = add_daily_noise(point, std, horizon)
+        low, high = band_from_point(point, std, horizon)
+        # Noise (and its band) must not leak past the hard sell-out cutoff - once
+        # inventory is gone, revenue is exactly 0, not a small random wobble around 0.
+        past_cutoff = np.arange(horizon) >= depletion_days
+        point = np.where(past_cutoff, 0.0, point)
+        low = np.where(past_cutoff, 0.0, low)
+        high = np.where(past_cutoff, 0.0, high)
         exclusions = []
     else:
         cleaned, exclusions = strip_outliers(series)
         if stage_used == "new":
-            point, low, high, model_used = fit_new(cleaned, horizon)
+            point, model_used = fit_new(cleaned, horizon)
         elif stage_used in ("mature", "plateau"):
-            point, low, high, model_used = fit_ets(cleaned, horizon, seasonal=True)
+            point, model_used = fit_ets(cleaned, horizon, seasonal=True)
         else:  # growth, declining
-            point, low, high, model_used = fit_ets(cleaned, horizon, seasonal=False)
-        point, low, high, blended = blend_with_py(cleaned, point, low, high, horizon)
+            point, model_used = fit_ets(cleaned, horizon, seasonal=False)
+        point, blended = blend_with_py(cleaned, point, horizon)
         if blended:
             model_used += "+py_blend"
-        point = add_daily_noise(point, cleaned, horizon)
+        std = _volatility(cleaned)
+        point = add_daily_noise(point, std, horizon)
+        low, high = band_from_point(point, std, horizon)
 
     generated_at = pd.Timestamp.utcnow()
     forecast_rows = [
