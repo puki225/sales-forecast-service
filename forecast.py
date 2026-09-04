@@ -209,10 +209,15 @@ def blend_with_py(series, point, horizon):
 # the line instead of a smooth curve sitting under a jagged one.
 NOISE_FRACTION = 0.7  # "a bit of" the measured volatility, not full-strength
 NOISE_WINDOW_DAYS = 28
-BAND_Z = 1.4  # multiple of that same volatility - bigger than NOISE_FRACTION so the band
-# comfortably contains a typical noise draw before the hard clip below even applies caps
-# it (roughly a 1.4/0.7 = 2x margin over one noise std, ~92% of individual noisy points
-# would land inside even without clipping - the clip is what makes it a hard 100%).
+# band_from_point() below builds the band AS point +/- this half-width, so low <= point
+# <= high holds for ANY positive BAND_Z - containment comes from the construction, not
+# from BAND_Z being large enough to "cover" the noise. An earlier version raised this to
+# 1.4 specifically to make the band comfortably wider than the noise before an (at the
+# time, still separate) containment clip kicked in - that reasoning stopped applying the
+# moment the band started being computed from the noisy point directly, and 1.4 just made
+# the shaded area unnecessarily wide with nothing to show for it. Tightened back down.
+BAND_Z = 0.5  # multiple of the measured volatility - purely a "how much wiggle room to
+# display" dial now, not a safety margin.
 BAND_RAMP_DAYS = 45  # width at day t scales by sqrt(1 + t/45): ~1.15x by day 7,
 # ~1.4x by day 45, ~2.2x by day 180 (end of a 6-month horizon).
 
