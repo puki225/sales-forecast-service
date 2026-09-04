@@ -238,6 +238,43 @@ def blend_with_py(series, point, low, high, horizon):
     return blended, blended_low, blended_high, True
 
 
+# Separate from BAND_* above on purpose: the band represents growing TREND uncertainty
+# over the horizon (widens with time), while day-to-day noise is a texture that doesn't
+# decay - a mature SKU is just as jumpy on day 150 as on day 1. Using the raw trailing
+# actual std, not a model's residual std: ETS's residual nets out the seasonal/trend
+# shape it just fitted, which understates the swings a viewer actually sees in the plotted
+# historical line - "the daily volatility you see in actuals" means the raw line, not
+# what's left over after the model explains most of it away.
+NOISE_FRACTION = 0.7  # "a bit of" that volatility, not full-strength
+NOISE_WINDOW_DAYS = 28
+
+
+def add_daily_noise(point, actual_series, horizon):
+    """Textures a smooth point forecast with i.i.d. noise scaled to the trailing actual
+    daily std, so the forecast reads as a plausible day-by-day sales path instead of a
+    suspiciously tidy trend line. Not seeded - a fresh, independent pattern each run is
+    more honest than an identical one appearing every night.
+
+    Measures volatility from day-over-day DIFFERENCES, not the raw level std of the
+    window - a fast-ramping short series (e.g. a brand-new SKU trending hard upward over
+    just its first few weeks) has a raw level std dominated by the trend itself, not by
+    actual noise, which blew the injected noise up to many times the real day-to-day
+    variance. Differencing cancels out a steady trend and isolates the noise; dividing by
+    sqrt(2) undoes the variance-doubling that differencing two independent noise terms
+    introduces, recovering the per-day noise sigma."""
+    if horizon <= 0:
+        return point
+    tail = actual_series.iloc[-NOISE_WINDOW_DAYS:]
+    if len(tail) < 3:
+        return point
+    diffs = tail.diff().dropna()
+    std = float(diffs.std()) / np.sqrt(2) if len(diffs) > 1 else 0.0
+    if std <= 0 or not np.isfinite(std):
+        return point
+    noise = np.random.default_rng().normal(0, std * NOISE_FRACTION, horizon)
+    return np.clip(point + noise, 0, None)
+
+
 def eol_forecast(daily_run_rate, depletion_days, horizon):
     """Sell at the current run rate until inventory (from the same velocity/sellable
     figures the Inventory tab uses) runs out, then stop - no restock assumed. Reflects the
@@ -260,6 +297,10 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
     if is_end_of_life and eol_inputs and eol_inputs.get("daily_velocity_units", 0) > 0:
         depletion_days = eol_inputs["sellable"] / eol_inputs["daily_velocity_units"]
         point, low, high, model_used = eol_forecast(eol_inputs["daily_run_rate"], depletion_days, horizon)
+        point = add_daily_noise(point, series, horizon)
+        # Noise must not leak past the hard sell-out cutoff - once inventory is gone,
+        # revenue is exactly 0, not a small random wobble around 0.
+        point = np.where(np.arange(horizon) < depletion_days, point, 0.0)
         exclusions = []
     else:
         cleaned, exclusions = strip_outliers(series)
@@ -272,6 +313,7 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
         point, low, high, blended = blend_with_py(cleaned, point, low, high, horizon)
         if blended:
             model_used += "+py_blend"
+        point = add_daily_noise(point, cleaned, horizon)
 
     generated_at = pd.Timestamp.utcnow()
     forecast_rows = [
