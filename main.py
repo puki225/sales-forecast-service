@@ -34,13 +34,19 @@ def health():
 @app.post("/run")
 def run(x_api_key: str = Header(default=None)):
     _check_auth(x_api_key)
-    conn = db.get_connection()
+    conn = None
     try:
+        conn = db.get_connection()
         summary = pipeline.run(conn)
         logger.info("Forecast run complete: %s", summary)
         return {"ok": True, **summary}
     except Exception as e:
+        # Was previously outside the try/except (only db.get_connection() - the actual
+        # pipeline call was covered): a bad/missing DATABASE_URL raised straight past this
+        # handler and out of FastAPI entirely, returning a bare "Internal Server Error"
+        # with no detail instead of the JSON error this except clause is meant to give.
         logger.exception("Forecast run failed")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
