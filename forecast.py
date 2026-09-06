@@ -410,19 +410,11 @@ def band_from_point(point, std, horizon):
     return low, high
 
 
-def eol_forecast(daily_run_rate, depletion_days, horizon):
-    """Sell at the current run rate until inventory (from the same velocity/sellable
-    figures the Inventory tab uses) runs out, then stop - no restock assumed. Reflects the
-    end-of-life checkbox on the Sales Forecast tab exactly, not a fitted curve."""
-    days = np.arange(horizon)
-    point = np.where(days < depletion_days, daily_run_rate, 0.0)
-    return point, "eol_depletion"
-
-
 def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs, horizon=90, catalog_index=None):
     """Returns (forecast_rows, exclusion_rows, stage_used). eol_inputs is a dict with
-    sellable/daily_velocity_units/daily_run_rate, or None if unavailable (falls back to a
-    non-EOL fit even if the checkbox is set, rather than fail outright).
+    sellable/daily_velocity_units, or None if unavailable (an end-of-life SKU with no
+    usable inventory/velocity figures just forecasts like any other SKU, uncapped - there's
+    nothing to cut off against).
 
     catalog_index, if given, is a length-`horizon` array: at each day out, how many times
     a SKU's own recent baseline the CATALOG as a whole tends to sell on that calendar date
@@ -431,59 +423,61 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
     weighted, so one large SKU can't dominate the "typical" seasonal shape the way it
     dominates a plain revenue-summed view). Applied ONLY when this SKU has no PY blend of
     its own (too little history) - a SKU with real PY data always trusts that over a
-    catalog-wide average of everyone else's."""
+    catalog-wide average of everyone else's.
+
+    End-of-life gets the exact same stage fit, PY/catalog seasonality, noise and band as
+    every other SKU - a SKU nearing its last units still sees a real Black Friday, so
+    there's no reason to forecast it flat. The only difference: once projected inventory
+    (same velocity/sellable figures the Inventory tab uses) would run out, sales stop
+    abruptly - point/low/high hard-clipped to 0 from that day on, no restock assumed."""
     series = reindex_daily(hist_df, today)
     gap_filled, gap_dates, gap_exclusions = detect_and_fill_gaps(series)
     stage_used = stage_override if stage_override in VALID_STAGES else classify_stage(gap_filled)
 
+    cleaned, event_retained, event_dates, spike_exclusions = strip_outliers(gap_filled, exclude_dates=gap_dates)
+    # Belt-and-suspenders: gap and spike exclusions come from independent checks and are
+    # already kept from overlapping via exclude_dates above, but never let a (sku, date)
+    # collision reach the DB regardless - sales_forecast_exclusions has a (sku,
+    # excluded_date) primary key and a duplicate insert fails the whole run.
+    seen_dates = set()
+    exclusions = []
+    for e in gap_exclusions + spike_exclusions:
+        if e["date"] in seen_dates:
+            continue
+        seen_dates.add(e["date"])
+        exclusions.append(e)
+    if stage_used == "new":
+        point, model_used = fit_new(cleaned, horizon)
+    elif stage_used in ("mature", "plateau"):
+        point, model_used = fit_ets(cleaned, horizon, seasonal=True)
+    else:  # growth, declining
+        point, model_used = fit_ets(cleaned, horizon, seasonal=False)
+    point, blended = blend_with_py(cleaned, event_retained, event_dates, point, horizon)
+    if blended:
+        model_used += "+py_blend"
+    elif catalog_index is not None:
+        # No PY history of its own (a young SKU) - borrow the catalog's typical
+        # seasonal shape instead of forecasting a flat trend through Black
+        # Friday/Christmas. Same ramp as blend_with_py (day 1 trusts the fitted
+        # model's current momentum, day 28+ trusts the seasonal shape) for the same
+        # reason: a damped trend's first few weeks reflect real recent signal this
+        # SKU actually has, which a borrowed catalog-wide average shouldn't override.
+        ramp = np.clip(np.arange(horizon) / 28, 0, 1)
+        point = ramp * (point * catalog_index) + (1 - ramp) * point
+        model_used += "+catalog_seasonal"
+    std = _volatility(cleaned)
+    point = add_daily_noise(point, std, horizon)
+    low, high = band_from_point(point, std, horizon)
+
     if is_end_of_life and eol_inputs and eol_inputs.get("daily_velocity_units", 0) > 0:
         depletion_days = eol_inputs["sellable"] / eol_inputs["daily_velocity_units"]
-        point, model_used = eol_forecast(eol_inputs["daily_run_rate"], depletion_days, horizon)
-        std = _volatility(gap_filled)
-        point = add_daily_noise(point, std, horizon)
-        low, high = band_from_point(point, std, horizon)
         # Noise (and its band) must not leak past the hard sell-out cutoff - once
         # inventory is gone, revenue is exactly 0, not a small random wobble around 0.
         past_cutoff = np.arange(horizon) >= depletion_days
         point = np.where(past_cutoff, 0.0, point)
         low = np.where(past_cutoff, 0.0, low)
         high = np.where(past_cutoff, 0.0, high)
-        exclusions = []
-    else:
-        cleaned, event_retained, event_dates, spike_exclusions = strip_outliers(gap_filled, exclude_dates=gap_dates)
-        # Belt-and-suspenders: gap and spike exclusions come from independent checks and
-        # are already kept from overlapping via exclude_dates above, but never let a
-        # (sku, date) collision reach the DB regardless - sales_forecast_exclusions has a
-        # (sku, excluded_date) primary key and a duplicate insert fails the whole run.
-        seen_dates = set()
-        exclusions = []
-        for e in gap_exclusions + spike_exclusions:
-            if e["date"] in seen_dates:
-                continue
-            seen_dates.add(e["date"])
-            exclusions.append(e)
-        if stage_used == "new":
-            point, model_used = fit_new(cleaned, horizon)
-        elif stage_used in ("mature", "plateau"):
-            point, model_used = fit_ets(cleaned, horizon, seasonal=True)
-        else:  # growth, declining
-            point, model_used = fit_ets(cleaned, horizon, seasonal=False)
-        point, blended = blend_with_py(cleaned, event_retained, event_dates, point, horizon)
-        if blended:
-            model_used += "+py_blend"
-        elif catalog_index is not None:
-            # No PY history of its own (a young SKU) - borrow the catalog's typical
-            # seasonal shape instead of forecasting a flat trend through Black
-            # Friday/Christmas. Same ramp as blend_with_py (day 1 trusts the fitted
-            # model's current momentum, day 28+ trusts the seasonal shape) for the same
-            # reason: a damped trend's first few weeks reflect real recent signal this
-            # SKU actually has, which a borrowed catalog-wide average shouldn't override.
-            ramp = np.clip(np.arange(horizon) / 28, 0, 1)
-            point = ramp * (point * catalog_index) + (1 - ramp) * point
-            model_used += "+catalog_seasonal"
-        std = _volatility(cleaned)
-        point = add_daily_noise(point, std, horizon)
-        low, high = band_from_point(point, std, horizon)
+        model_used += "+eol_cutoff"
 
     generated_at = pd.Timestamp.utcnow()
     forecast_rows = [

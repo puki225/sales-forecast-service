@@ -36,13 +36,15 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
    - `new` → logistic growth curve (S-shaped ramp toward a ceiling, not a straight line)
    - `growth` / `declining` → damped-trend ETS
    - `mature` / `plateau` → damped-trend ETS **with weekly seasonality**
-   - **end-of-life** (checkbox on the tab) → no fitted curve at all: sell at the current
-     run rate until FBA sellable stock runs out (same velocity math `/api/inventory` uses
-     for its "days of inventory left"), then zero - no restock assumed.
-5. **Blend with prior-year seasonality**, for any SKU with 380+ days of history (not
-   end-of-life): a damped trend flattens out by design over a 6-month horizon and never
-   reproduces a real yearly cycle (a Christmas bump, a summer dip) on its own, however
-   much history it's fitted on. This recenters the point estimate onto PY's same-date
+   - **end-of-life** (checkbox on the tab) gets the exact same fit as everything else here
+     - a SKU on its last units still sees a real Black Friday, so there's no reason to
+     forecast it flat. The only difference end-of-life makes is in step 7 below: once
+     projected inventory runs out, sales stop abruptly rather than fading out or
+     continuing past what's actually sellable.
+5. **Blend with prior-year seasonality**, for any SKU with 380+ days of history: a damped
+   trend flattens out by design over a 6-month horizon and never reproduces a real yearly
+   cycle (a Christmas bump, a summer dip) on its own, however much history it's fitted on.
+   This recenters the point estimate onto PY's same-date
    revenue, scaled by this year's trailing-56d vs PY's growth factor, ramping from "trust
    the fitted model" (day 1) to "trust the PY shape" (day 28+). `model_used` gets a
    `+py_blend` suffix when this applied. Below 380 days of history, forecast stays purely
@@ -66,7 +68,7 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
      existed (a few large SKUs' totals swamping everyone else's in any pooled view). Same
      day-1-to-day-28 trust ramp as the PY blend; `model_used` gets a `+catalog_seasonal`
      suffix when this applied.
-7. **Texture the point forecast with daily noise**, then **compute the band from that
+6. **Texture the point forecast with daily noise**, then **compute the band from that
    noisy point** - in that order. `_volatility()` measures the trailing actual day-to-day
    volatility from differenced daily values (so a steady trend doesn't get mistaken for
    noise); `add_daily_noise()` adds i.i.d. noise scaled to 0.7x that figure, so the line
@@ -79,6 +81,15 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
    smooth curve sitting under a jagged one. An earlier version computed the band from the
    pre-noise point using each model's own residual std, which decoupled the two badly
    enough that the noisy line routinely poked outside its own band.
+7. **End-of-life depletion cutoff** - the one and only place the end-of-life checkbox
+   changes anything: once projected inventory (`sellable / daily_velocity_units`, the same
+   velocity math `/api/inventory` uses for its "days of inventory left") would run out,
+   `forecast_revenue`/`low_revenue`/`high_revenue` are hard-clipped to 0 from that day
+   forward - no restock assumed, and no noise/band wobble around 0 either. Everything
+   before this point (stage fit, PY/catalog seasonality, noise, band) is untouched -
+   `model_used` just gets a `+eol_cutoff` suffix appended. A SKU flagged end-of-life with
+   no usable sellable/velocity figures forecasts exactly like any other SKU, uncapped -
+   there's nothing to cut off against.
 8. Writes `forecast_revenue` + that band per day, replacing that SKU's previous forecast
    rows.
 
@@ -158,4 +169,4 @@ DB_HOST=... DB_PORT=5432 DB_NAME=... DB_USER=... DB_PASSWORD=... uvicorn main:ap
 
 `forecast.py` has no database dependency and can be exercised directly with a synthetic
 pandas DataFrame - see the docstrings on `run_for_sku`, `classify_stage`, `strip_outliers`,
-`fit_new`, `fit_ets`, and `eol_forecast` for the shape each expects.
+`fit_new`, and `fit_ets` for the shape each expects.

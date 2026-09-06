@@ -113,11 +113,7 @@ def run(conn):
             summary["skus_skipped_inactive"] += 1
             continue
 
-        eol_inputs = None
-        if is_eol and sku in eol_velocity:
-            trailing_7d = df_sku[df_sku["date"] >= today - pd.Timedelta(days=7)]["revenue"].mean()
-            eol_inputs = dict(eol_velocity[sku])
-            eol_inputs["daily_run_rate"] = float(trailing_7d) if pd.notna(trailing_7d) else 0.0
+        eol_inputs = eol_velocity.get(sku) if is_eol else None
 
         try:
             rows, exclusions, stage_used = fc.run_for_sku(
