@@ -7,6 +7,7 @@ database and the DB access free of modeling assumptions.
 import logging
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 
 import db
@@ -19,6 +20,52 @@ HISTORY_LOOKBACK_DAYS = 730  # 2 years - enough for a yearly-seasonal SKU, bound
 HORIZON_DAYS = 180  # ~6 months - a forecast is only actually useful at this range, per
 # the tab's own design discussion; the UI lets you view it at daily/weekly/monthly
 # granularity and doesn't force looking at all 180 raw daily points at once.
+
+CATALOG_INDEX_BASELINE_DAYS = 28  # each contributing SKU's own recent-run-rate baseline,
+# the denominator its PY-implied point gets measured against before averaging into the
+# catalog-wide index - short enough to reflect "current" run rate, long enough not to be
+# thrown by a single noisy day.
+CATALOG_INDEX_CLIP = (0.1, 10.0)  # bounds each SKU's own contributed ratio before
+# averaging - guards the whole-catalog index against one thin/noisy contributor implying
+# an absurd multiplier for every young SKU that borrows it.
+
+
+def build_catalog_seasonal_index(daily, config, today, horizon):
+    """A length-`horizon` array: at each day out, how many times a typical SKU's own
+    recent baseline the catalog as a whole tends to sell on that calendar date - built
+    from every SKU with enough history for its own PY comparison (same PY_MIN_HISTORY_DAYS
+    gate run_for_sku already applies), equal-weighted across contributors rather than
+    revenue-weighted, so the SKU that happens to be the single biggest earner doesn't
+    define "typical" seasonality for everyone else - it's exactly a few large SKUs
+    dominating a plain revenue-summed view that made the whole catalog look artificially
+    flat before this existed. End-of-life SKUs are excluded from contributing: their
+    current trajectory is an intentional wind-down, not representative demand. Returns
+    None if no SKU qualifies (e.g. an entirely new catalog) - callers should treat that as
+    "no catalog signal available" and fall back to whatever they'd otherwise do."""
+    ratios = []
+    for sku, df_sku in daily.groupby("sku"):
+        df_sku = df_sku[df_sku["date"] < today]
+        if df_sku.empty:
+            continue
+        cfg = config.loc[sku] if sku in config.index else None
+        if cfg is not None and bool(cfg["is_end_of_life"]):
+            continue
+        series = fc.reindex_daily(df_sku[["date", "revenue"]], today)
+        if len(series) < fc.PY_MIN_HISTORY_DAYS:
+            continue
+        gap_filled, gap_dates, _ = fc.detect_and_fill_gaps(series)
+        cleaned, event_retained, event_dates, _ = fc.strip_outliers(gap_filled, exclude_dates=gap_dates)
+        py_point, has_py = fc.py_naive_forecast(cleaned, event_retained, event_dates, horizon)
+        if not has_py:
+            continue
+        baseline = float(cleaned.iloc[-CATALOG_INDEX_BASELINE_DAYS:].mean())
+        if baseline <= 0:
+            continue
+        ratios.append(np.clip(py_point / baseline, *CATALOG_INDEX_CLIP))
+
+    if not ratios:
+        return None
+    return np.mean(ratios, axis=0)
 
 
 def _eol_velocity(row):
@@ -45,6 +92,7 @@ def run(conn):
     eol_raw = db.fetch_eol_inputs(conn).set_index("sku")
     eol_velocity = {sku: {"sellable": float(row["sellable"] or 0), "daily_velocity_units": _eol_velocity(row)}
                      for sku, row in eol_raw.iterrows()}
+    catalog_index = build_catalog_seasonal_index(daily, config, today, HORIZON_DAYS)
 
     all_forecast_rows = []
     all_exclusion_rows = []
@@ -75,6 +123,7 @@ def run(conn):
             rows, exclusions, stage_used = fc.run_for_sku(
                 sku, df_sku[["date", "revenue"]], today,
                 stage_override, is_eol, eol_inputs, horizon=HORIZON_DAYS,
+                catalog_index=catalog_index,
             )
         except Exception:
             logger.exception("Forecast failed for SKU %s - skipping it this run", sku)

@@ -419,10 +419,19 @@ def eol_forecast(daily_run_rate, depletion_days, horizon):
     return point, "eol_depletion"
 
 
-def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs, horizon=90):
+def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs, horizon=90, catalog_index=None):
     """Returns (forecast_rows, exclusion_rows, stage_used). eol_inputs is a dict with
     sellable/daily_velocity_units/daily_run_rate, or None if unavailable (falls back to a
-    non-EOL fit even if the checkbox is set, rather than fail outright)."""
+    non-EOL fit even if the checkbox is set, rather than fail outright).
+
+    catalog_index, if given, is a length-`horizon` array: at each day out, how many times
+    a SKU's own recent baseline the CATALOG as a whole tends to sell on that calendar date
+    (see pipeline.py's build_catalog_seasonal_index - an equal-weighted average across
+    every SKU with enough history for its own PY comparison, deliberately not revenue-
+    weighted, so one large SKU can't dominate the "typical" seasonal shape the way it
+    dominates a plain revenue-summed view). Applied ONLY when this SKU has no PY blend of
+    its own (too little history) - a SKU with real PY data always trusts that over a
+    catalog-wide average of everyone else's."""
     series = reindex_daily(hist_df, today)
     gap_filled, gap_dates, gap_exclusions = detect_and_fill_gaps(series)
     stage_used = stage_override if stage_override in VALID_STAGES else classify_stage(gap_filled)
@@ -462,6 +471,16 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
         point, blended = blend_with_py(cleaned, event_retained, event_dates, point, horizon)
         if blended:
             model_used += "+py_blend"
+        elif catalog_index is not None:
+            # No PY history of its own (a young SKU) - borrow the catalog's typical
+            # seasonal shape instead of forecasting a flat trend through Black
+            # Friday/Christmas. Same ramp as blend_with_py (day 1 trusts the fitted
+            # model's current momentum, day 28+ trusts the seasonal shape) for the same
+            # reason: a damped trend's first few weeks reflect real recent signal this
+            # SKU actually has, which a borrowed catalog-wide average shouldn't override.
+            ramp = np.clip(np.arange(horizon) / 28, 0, 1)
+            point = ramp * (point * catalog_index) + (1 - ramp) * point
+            model_used += "+catalog_seasonal"
         std = _volatility(cleaned)
         point = add_daily_noise(point, std, horizon)
         low, high = band_from_point(point, std, horizon)

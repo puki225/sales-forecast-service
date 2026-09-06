@@ -55,7 +55,18 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
      directly instead of being averaged away, so a SKU that sold well last Black Friday is
      forecast to sell well on the equivalent date this year too, rather than that day
      quietly reverting to baseline the way a straight damped-trend fit would.
-6. **Texture the point forecast with daily noise**, then **compute the band from that
+   - Below 380 days, there's no PY comparison of this SKU's own to blend with - but a
+     **catalog-wide seasonal index**, built once per run from every SKU that *does* clear
+     380 days (`pipeline.build_catalog_seasonal_index` - excluding end-of-life SKUs, whose
+     current trajectory is an intentional wind-down, not representative demand), applies
+     instead when one is available: each contributing SKU's own PY-implied point is
+     measured as a multiple of its own recent 28-day baseline, and those multiples are
+     averaged **equal-weighted** across contributors - deliberately not revenue-weighted,
+     since revenue-weighting is exactly what made the catalog look falsely flat before this
+     existed (a few large SKUs' totals swamping everyone else's in any pooled view). Same
+     day-1-to-day-28 trust ramp as the PY blend; `model_used` gets a `+catalog_seasonal`
+     suffix when this applied.
+7. **Texture the point forecast with daily noise**, then **compute the band from that
    noisy point** - in that order. `_volatility()` measures the trailing actual day-to-day
    volatility from differenced daily values (so a steady trend doesn't get mistaken for
    noise); `add_daily_noise()` adds i.i.d. noise scaled to 0.7x that figure, so the line
@@ -68,7 +79,7 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
    smooth curve sitting under a jagged one. An earlier version computed the band from the
    pre-noise point using each model's own residual std, which decoupled the two badly
    enough that the noisy line routinely poked outside its own band.
-7. Writes `forecast_revenue` + that band per day, replacing that SKU's previous forecast
+8. Writes `forecast_revenue` + that band per day, replacing that SKU's previous forecast
    rows.
 
 A SKU with no sale in the last 180 days is skipped (dormant/delisted), unless the user has
