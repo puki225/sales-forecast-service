@@ -138,15 +138,24 @@ def write_forecast(conn, rows):
 def write_exclusions(conn, rows):
     """rows: list of dicts with sku, excluded_date, reason. Same replace-per-SKU approach
     as write_forecast - an outlier that drops out of the rolling detection window on a
-    later run shouldn't stay flagged forever."""
+    later run shouldn't stay flagged forever.
+
+    De-dupes on (sku, excluded_date) before inserting, keeping the first reason seen -
+    sales_forecast_exclusions has that as its primary key, so any caller-side collision
+    (forecast.py already guards against the one known way this could happen) would
+    otherwise fail the bulk insert and abort the whole run rather than just this row."""
     if not rows:
         return
-    skus = list({r["sku"] for r in rows})
+    seen = {}
+    for r in rows:
+        seen.setdefault((r["sku"], r["excluded_date"]), r)
+    deduped = list(seen.values())
+    skus = list({r["sku"] for r in deduped})
     with conn.cursor() as cur:
         cur.execute("DELETE FROM sales_forecast_exclusions WHERE sku = ANY(%s)", (skus,))
         psycopg2.extras.execute_values(
             cur,
             "INSERT INTO sales_forecast_exclusions (sku, excluded_date, reason) VALUES %s",
-            [(r["sku"], r["excluded_date"], r["reason"]) for r in rows],
+            [(r["sku"], r["excluded_date"], r["reason"]) for r in deduped],
         )
     conn.commit()

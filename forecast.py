@@ -69,12 +69,19 @@ def detect_and_fill_gaps(series):
     whether/when it restocks, and second-guessing that is what stage_override and the
     end-of-life flag are already for, not something to infer silently here.
 
-    Returns (filled_series, exclusion_rows) - same shape as strip_outliers()'s exclusion
-    list, one row per gap (not per day) so "N periods excluded" on the tab still reads as
-    N distinct events, not N individual days.
+    Returns (filled_series, filled_dates, exclusion_rows). `filled_dates` is every
+    individual date inside a filled gap (not just the gap's start) - strip_outliers() uses
+    it to skip re-examining those days: the interpolated seam at a gap's edge is a real
+    step change (a straight line meeting real data), and without this it could itself trip
+    the MAD spike check and get flagged a second time, which once wrote two exclusion rows
+    for the same (sku, date) and violated sales_forecast_exclusions' primary key. A day
+    already explained by a gap doesn't need a second, redundant "this looked odd" reason.
+    `exclusion_rows` is one row per gap (not per day) so "N periods excluded" on the tab
+    still reads as N distinct events, not N individual days.
     """
     is_zero = (series <= 0.0).values
     filled = series.copy()
+    filled_dates = set()
     exclusions = []
 
     run_start = None
@@ -99,11 +106,12 @@ def detect_and_fill_gaps(series):
             continue
         pre_mean, post_mean = float(pre.mean()), float(post.mean())
         filled.iloc[start:end + 1] = np.linspace(pre_mean, post_mean, length)
+        filled_dates.update(series.index[start:end + 1])
         exclusions.append({
             "date": series.index[start],
             "reason": f"{length}-day zero-revenue gap (likely stockout), filled with baseline estimate",
         })
-    return filled, exclusions
+    return filled, filled_dates, exclusions
 
 
 def classify_stage(series):
@@ -156,7 +164,7 @@ def event_window_for_date(date):
     return None
 
 
-def strip_outliers(series):
+def strip_outliers(series, exclude_dates=frozenset()):
     """Returns (cleaned, event_retained, event_dates, exclusion_rows).
 
     `cleaned` has EVERY flagged spike (event or not) replaced by its local rolling median -
@@ -172,13 +180,22 @@ def strip_outliers(series):
     ordinary day inside the same broad calendar window even when nothing was ever detected
     as a spike there. A random one-off spike (a bulk order, a data glitch) outside any
     event window is flattened out of both, same as before - there's no reason to expect it
-    again."""
+    again.
+
+    `exclude_dates` (typically detect_and_fill_gaps()'s filled_dates) is skipped by the
+    spike check entirely - the interpolated seam at a gap's edge is a real step change (a
+    straight line meeting real data either side of it) that can otherwise trip the MAD
+    check on its own, flagging a day that's already accounted for by the gap fill a second
+    time under a different reason - and once caused a duplicate (sku, excluded_date) row
+    that violated sales_forecast_exclusions' primary key."""
     rolling_median = series.rolling(OUTLIER_WINDOW_DAYS, min_periods=7, center=True).median()
     resid = series - rolling_median
     mad = resid.abs().rolling(OUTLIER_WINDOW_DAYS, min_periods=7, center=True).median()
     mad_safe = mad.replace(0, np.nan)
     z = (resid / (1.4826 * mad_safe)).abs()
     is_outlier = (z > OUTLIER_MAD_THRESHOLD) & rolling_median.notna()
+    if exclude_dates:
+        is_outlier[series.index.isin(exclude_dates)] = False
 
     cleaned = series.copy()
     cleaned[is_outlier] = rolling_median[is_outlier]
@@ -407,7 +424,7 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
     sellable/daily_velocity_units/daily_run_rate, or None if unavailable (falls back to a
     non-EOL fit even if the checkbox is set, rather than fail outright)."""
     series = reindex_daily(hist_df, today)
-    gap_filled, gap_exclusions = detect_and_fill_gaps(series)
+    gap_filled, gap_dates, gap_exclusions = detect_and_fill_gaps(series)
     stage_used = stage_override if stage_override in VALID_STAGES else classify_stage(gap_filled)
 
     if is_end_of_life and eol_inputs and eol_inputs.get("daily_velocity_units", 0) > 0:
@@ -424,8 +441,18 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
         high = np.where(past_cutoff, 0.0, high)
         exclusions = []
     else:
-        cleaned, event_retained, event_dates, spike_exclusions = strip_outliers(gap_filled)
-        exclusions = gap_exclusions + spike_exclusions
+        cleaned, event_retained, event_dates, spike_exclusions = strip_outliers(gap_filled, exclude_dates=gap_dates)
+        # Belt-and-suspenders: gap and spike exclusions come from independent checks and
+        # are already kept from overlapping via exclude_dates above, but never let a
+        # (sku, date) collision reach the DB regardless - sales_forecast_exclusions has a
+        # (sku, excluded_date) primary key and a duplicate insert fails the whole run.
+        seen_dates = set()
+        exclusions = []
+        for e in gap_exclusions + spike_exclusions:
+            if e["date"] in seen_dates:
+                continue
+            seen_dates.add(e["date"])
+            exclusions.append(e)
         if stage_used == "new":
             point, model_used = fit_new(cleaned, horizon)
         elif stage_used in ("mature", "plateau"):
