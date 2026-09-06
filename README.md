@@ -11,45 +11,71 @@ call it on a schedule; this service has no scheduler of its own.
 Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of discounts
 **and** refunds - the same figure the dashboard calls "net revenue" everywhere else):
 
-1. **Classify growth stage** - `new` / `growth` / `mature` / `plateau` / `declining`,
+1. **Fill supply-shortage gaps** - a run of 14+ consecutive £0 days (a stockout, not just
+   quiet demand) gets replaced, for fitting purposes only, with a straight-line estimate
+   between the trailing and leading baseline either side of it, so a 2-week-to-several-
+   month shortage doesn't get learned as "this SKU's demand fell to zero" (it would
+   otherwise drag down both the stage classification below and the fitted trend/level for
+   however long the gap lasted). Logged in `sales_forecast_exclusions` as one row per gap.
+   Only a gap fully enclosed by real data on both sides is filled - one still running
+   through the most recent day is left as real zeros, since there's no way to know from
+   history alone whether/when it restocks (that's what `stage_override`/end-of-life are
+   for).
+2. **Classify growth stage** - `new` / `growth` / `mature` / `plateau` / `declining`,
    unless the SKU has a manual `stage_override` set on the Sales Forecast tab, which
    always wins.
-2. **Strip outliers** - a local-median/MAD check flags genuine one-off spikes (Prime Day,
-   a bulk order) and excludes them from the fit, recorded in `sales_forecast_exclusions`
-   so the tab can show why.
-3. **Fit a model for that stage** and project 180 days (~6 months) forward:
+3. **Strip outliers** - a local-median/MAD check flags genuine one-off spikes (Prime Day,
+   Black Friday, a bulk order) and excludes them from the fit, recorded in
+   `sales_forecast_exclusions` so the tab can show why. A spike that lands inside a known
+   recurring Amazon sales-event window (Black Friday/Cyber Monday - calendar-fixed around
+   the 4th Thursday of November; Prime Day/Prime Big Deal Days - no fixed date, so a
+   broad July/October window stands in) is tagged as such and its real value is kept
+   around separately for step 5 below, rather than being discarded outright like a random
+   one-off spike (a bulk order, a data glitch) is.
+4. **Fit a model for that stage** and project 180 days (~6 months) forward:
    - `new` → logistic growth curve (S-shaped ramp toward a ceiling, not a straight line)
    - `growth` / `declining` → damped-trend ETS
    - `mature` / `plateau` → damped-trend ETS **with weekly seasonality**
    - **end-of-life** (checkbox on the tab) → no fitted curve at all: sell at the current
      run rate until FBA sellable stock runs out (same velocity math `/api/inventory` uses
      for its "days of inventory left"), then zero - no restock assumed.
-4. **Blend with prior-year seasonality**, for any SKU with 380+ days of history (not
+5. **Blend with prior-year seasonality**, for any SKU with 380+ days of history (not
    end-of-life): a damped trend flattens out by design over a 6-month horizon and never
    reproduces a real yearly cycle (a Christmas bump, a summer dip) on its own, however
    much history it's fitted on. This recenters the point estimate onto PY's same-date
-   revenue (7-day-smoothed, scaled by this year's trailing-56d vs PY's growth factor),
-   ramping from "trust the fitted model" (day 1) to "trust the PY shape" (day 28+).
-   `model_used` gets a `+py_blend` suffix when this applied. Below 380 days of history,
-   forecast stays purely the stage-based fit from step 3.
-5. **Texture the point forecast with daily noise**, then **compute the band from that
+   revenue, scaled by this year's trailing-56d vs PY's growth factor, ramping from "trust
+   the fitted model" (day 1) to "trust the PY shape" (day 28+). `model_used` gets a
+   `+py_blend` suffix when this applied. Below 380 days of history, forecast stays purely
+   the stage-based fit from step 4.
+   - For most days, the PY value is a ±3-day centered average around the matching PY date,
+     same as before - smooths single-day noise out of the seasonal shape.
+   - For a target date whose matching PY window contains an *actual* detected recurring-
+     event spike (step 3's Black Friday/Cyber Monday/Prime Day tagging - not just any day
+     that happens to fall in the same calendar month), that day's real peak value is used
+     directly instead of being averaged away, so a SKU that sold well last Black Friday is
+     forecast to sell well on the equivalent date this year too, rather than that day
+     quietly reverting to baseline the way a straight damped-trend fit would.
+6. **Texture the point forecast with daily noise**, then **compute the band from that
    noisy point** - in that order. `_volatility()` measures the trailing actual day-to-day
    volatility from differenced daily values (so a steady trend doesn't get mistaken for
    noise); `add_daily_noise()` adds i.i.d. noise scaled to 0.7x that figure, so the line
    reads as a plausible day-by-day sales path instead of a suspiciously smooth curve; not
    seeded, a fresh pattern every run rather than an identical one every night.
    `band_from_point()` then builds `low_revenue`/`high_revenue` as that *same* noisy point
-   ± `1.4 × volatility`, widening by `sqrt(1 + days_out/45)` - which makes `low <= point
+   ± `0.5 × volatility`, widening by `sqrt(1 + days_out/45)` - which makes `low <= point
    <= high` a hard guarantee by construction (not just "usually true"), and gives the
    band's own edges the same jagged, real-looking texture as the line, rather than a
    smooth curve sitting under a jagged one. An earlier version computed the band from the
    pre-noise point using each model's own residual std, which decoupled the two badly
    enough that the noisy line routinely poked outside its own band.
-6. Writes `forecast_revenue` + that band per day, replacing that SKU's previous forecast
+7. Writes `forecast_revenue` + that band per day, replacing that SKU's previous forecast
    rows.
 
 A SKU with no sale in the last 180 days is skipped (dormant/delisted), unless the user has
-explicitly configured it (an override or the end-of-life flag).
+explicitly configured it (an override or the end-of-life flag). Note this is a *trailing*
+window check against the raw data, independent of step 1's gap-fill (which only touches
+enclosed historical gaps) - a SKU still mid-shortage today with no resolution yet in the
+data stays correctly excluded here rather than silently forecast as if it were selling.
 
 Revenue-only - no unit/ASP split, no price elasticity. PVM already covers price-vs-volume
 historically; this only projects the top-line number forward.

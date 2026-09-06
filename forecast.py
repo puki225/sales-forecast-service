@@ -29,6 +29,14 @@ ACTIVITY_WINDOW_DAYS = 180
 OUTLIER_MAD_THRESHOLD = 7.0
 OUTLIER_WINDOW_DAYS = 28
 
+# Supply-shortage/stockout gaps: a run of this many-or-more consecutive zero-revenue days
+# reads as "out of stock", not "no demand" - short of this, a quiet stretch is just normal
+# variance the model should learn from as-is.
+GAP_MIN_DAYS = 14
+# Trailing/leading window either side of a detected gap, averaged to estimate what the
+# gap "should" have sold - see detect_and_fill_gaps().
+GAP_BASELINE_WINDOW_DAYS = 14
+
 
 def reindex_daily(df_sku, today):
     """df_sku: columns [date, revenue, units] for one SKU, sparse (only days with orders).
@@ -41,6 +49,61 @@ def reindex_daily(df_sku, today):
     s = df_sku.set_index("date")["revenue"].reindex(idx, fill_value=0.0)
     s.index.name = "date"
     return s
+
+
+def detect_and_fill_gaps(series):
+    """Finds runs of GAP_MIN_DAYS+ consecutive zero-revenue days - a supply-shortage/
+    stockout signature, not the outlier spikes strip_outliers() catches (that's the
+    opposite direction, and a MAD z-score against a rolling median doesn't even see a
+    sustained drop to zero: the rolling median just gets pulled down to ~0 across the gap
+    right along with it, so it never reads as anomalous on its own). Left unhandled, a
+    2-week-to-several-month stockout gets learned as "this SKU's demand fell to zero",
+    dragging down both the stage classification (classify_stage) and the fitted
+    trend/level for however long the gap lasts.
+
+    Only a gap fully enclosed by nonzero data on both sides gets filled, with a straight-
+    line ramp between the trailing and leading baseline either side of it (a flat average
+    when those two baselines happen to match, a ramp when the SKU's run rate genuinely
+    differs before vs after - e.g. it grew in the meantime). A gap still running through
+    the most recent day is left untouched: there's no way to know from history alone
+    whether/when it restocks, and second-guessing that is what stage_override and the
+    end-of-life flag are already for, not something to infer silently here.
+
+    Returns (filled_series, exclusion_rows) - same shape as strip_outliers()'s exclusion
+    list, one row per gap (not per day) so "N periods excluded" on the tab still reads as
+    N distinct events, not N individual days.
+    """
+    is_zero = (series <= 0.0).values
+    filled = series.copy()
+    exclusions = []
+
+    run_start = None
+    runs = []
+    for i, z in enumerate(is_zero):
+        if z and run_start is None:
+            run_start = i
+        elif not z and run_start is not None:
+            runs.append((run_start, i - 1))
+            run_start = None
+    # A run still open at the end of the series is an ongoing/unresolved gap - deliberately
+    # excluded from `runs` above (the loop only closes a run on a nonzero day), so it's
+    # left as real zeros rather than guessed at.
+
+    for start, end in runs:
+        length = end - start + 1
+        if length < GAP_MIN_DAYS or start == 0:
+            continue
+        pre = series.iloc[max(0, start - GAP_BASELINE_WINDOW_DAYS):start]
+        post = series.iloc[end + 1: end + 1 + GAP_BASELINE_WINDOW_DAYS]
+        if pre.empty or post.empty:
+            continue
+        pre_mean, post_mean = float(pre.mean()), float(post.mean())
+        filled.iloc[start:end + 1] = np.linspace(pre_mean, post_mean, length)
+        exclusions.append({
+            "date": series.index[start],
+            "reason": f"{length}-day zero-revenue gap (likely stockout), filled with baseline estimate",
+        })
+    return filled, exclusions
 
 
 def classify_stage(series):
@@ -65,11 +128,51 @@ def classify_stage(series):
     return "mature"
 
 
+def _nth_weekday_of_month(year, month, weekday, n):
+    """Date of the nth given weekday (Monday=0) in a given year/month - e.g.
+    _nth_weekday_of_month(2026, 11, 3, 4) is the 4th Thursday of November 2026
+    (Thanksgiving), the calendar anchor Black Friday/Cyber Monday is defined from."""
+    first = pd.Timestamp(year=year, month=month, day=1)
+    first_match = first + pd.Timedelta(days=(weekday - first.weekday()) % 7)
+    return first_match + pd.Timedelta(days=7 * (n - 1))
+
+
+def event_window_for_date(date):
+    """Label if `date` falls in a known recurring Amazon sales-event window, else None.
+    Black Friday/Cyber Monday is calendar-fixed (Thu-Mon around the 4th Thursday of
+    November) so this is exact. Prime Day and Prime Big Deal Days have no fixed date
+    (Amazon announces them roughly a month out), so a broad month-wide window stands in
+    for them instead - it may miss a year where the actual date falls outside it, or
+    loosely tag a few surrounding ordinary days, but the alternative (nothing at all) is
+    strictly worse for what this is used for: telling a genuine recurring promotional
+    spike apart from a random one-off outlier."""
+    thanksgiving = _nth_weekday_of_month(date.year, 11, 3, 4)
+    if thanksgiving <= date <= thanksgiving + pd.Timedelta(days=4):
+        return "Black Friday / Cyber Monday"
+    if pd.Timestamp(year=date.year, month=7, day=1) <= date <= pd.Timestamp(year=date.year, month=7, day=20):
+        return "Prime Day"
+    if pd.Timestamp(year=date.year, month=10, day=1) <= date <= pd.Timestamp(year=date.year, month=10, day=20):
+        return "Prime Big Deal Days"
+    return None
+
+
 def strip_outliers(series):
-    """Returns (cleaned_series, excluded_dates_with_reason) - cleaned has each flagged
-    spike replaced by its local rolling median so the fit below never sees it, while the
-    original dates/reasons are kept separately for the sales_forecast_exclusions table
-    (and the "⚑ N periods excluded" note on the Sales Forecast tab)."""
+    """Returns (cleaned, event_retained, event_dates, exclusion_rows).
+
+    `cleaned` has EVERY flagged spike (event or not) replaced by its local rolling median -
+    used for the stage fit, the PY growth-factor comparison, and the noise/band volatility
+    measure, none of which should have a single promotional day baked into what they treat
+    as "normal". `event_retained` is the same, except a spike that falls inside a known
+    recurring-event window (event_window_for_date) keeps its ORIGINAL value instead of
+    being flattened - used only for the per-day PY seasonal lookup (py_naive_forecast), so
+    a SKU that sold well last Black Friday/Prime Day is forecast to sell well on the
+    equivalent date this year too, rather than that day quietly reverting to baseline.
+    `event_dates` is the set of dates that actually got that treatment - deliberately NOT
+    re-derived later from event_window_for_date() alone, which would also match every
+    ordinary day inside the same broad calendar window even when nothing was ever detected
+    as a spike there. A random one-off spike (a bulk order, a data glitch) outside any
+    event window is flattened out of both, same as before - there's no reason to expect it
+    again."""
     rolling_median = series.rolling(OUTLIER_WINDOW_DAYS, min_periods=7, center=True).median()
     resid = series - rolling_median
     mad = resid.abs().rolling(OUTLIER_WINDOW_DAYS, min_periods=7, center=True).median()
@@ -79,12 +182,21 @@ def strip_outliers(series):
 
     cleaned = series.copy()
     cleaned[is_outlier] = rolling_median[is_outlier]
+    event_retained = cleaned.copy()
+    event_dates = set()
 
     exclusions = []
     for d in series.index[is_outlier]:
         multiple = series[d] / rolling_median[d] if rolling_median[d] else float("inf")
-        exclusions.append({"date": d, "reason": f"Revenue {multiple:.1f}x local trend"})
-    return cleaned, exclusions
+        event_label = event_window_for_date(d)
+        if event_label:
+            event_retained[d] = series[d]
+            event_dates.add(d)
+            reason = f"{event_label} spike ({multiple:.1f}x local trend) - excluded from baseline, carried forward to this year's {event_label}"
+        else:
+            reason = f"Revenue {multiple:.1f}x local trend"
+        exclusions.append({"date": d, "reason": reason})
+    return cleaned, event_retained, event_dates, exclusions
 
 
 def _logistic(t, L, k, t0):
@@ -156,41 +268,56 @@ PY_GROWTH_FACTOR_BOUNDS = (0.3, 3.0)  # guards against a near-zero PY trailing w
 # (or a genuine outlier week) implying an absurd multiplier.
 
 
-def py_naive_forecast(series, horizon):
-    """Prior-year seasonal shape (same calendar dates 364 days back, centered 7-day
-    average to smooth noise) scaled by this year's trailing-56d vs PY's same-56d growth
-    factor. Returns (point array, True) or (None, False) if there isn't a full PY of
-    history yet. This is what actually carries seasonality forward past the point a
-    damped-trend ETS fit has flattened out - ETS's trend decays toward zero by design, so
-    on its own it never reproduces a real yearly cycle (a Christmas bump, a summer dip),
-    no matter how much history it's given."""
-    if len(series) < PY_MIN_HISTORY_DAYS:
+def py_naive_forecast(cleaned_series, lookup_series, event_dates, horizon):
+    """Prior-year seasonal shape (same calendar dates 364 days back) scaled by this year's
+    trailing-56d vs PY's same-56d growth factor. Returns (point array, True) or
+    (None, False) if there isn't a full PY of history yet. This is what actually carries
+    seasonality forward past the point a damped-trend ETS fit has flattened out - ETS's
+    trend decays toward zero by design, so on its own it never reproduces a real yearly
+    cycle (a Christmas bump, a summer dip), no matter how much history it's given.
+
+    The growth factor is read from `cleaned_series` (outliers, event spikes included,
+    flattened to local trend) so it's an apples-to-apples "how has normal demand moved"
+    comparison, not skewed by whichever window a Black Friday happens to land in. The
+    per-day PY value is read from `lookup_series` (same, except a date in `event_dates` -
+    an ACTUAL detected Black Friday/Cyber Monday/Prime Day spike, not just any day that
+    happens to fall in that calendar month - keeps its real value): when the +/-
+    PY_WINDOW_DAYS window around a target date's PY-shifted date contains one of those, the
+    day carries forward at its own peak value scaled by the growth factor, undiluted by
+    averaging against the ordinary days around it (a centered mean would wash a 5x spike
+    day down to a small bump); everywhere else, the existing centered-mean smoothing
+    applies exactly as before."""
+    if len(cleaned_series) < PY_MIN_HISTORY_DAYS:
         return None, False
-    last_date = series.index[-1]
+    last_date = cleaned_series.index[-1]
     py_trailing_end = last_date - pd.Timedelta(days=PY_SHIFT_DAYS)
     py_trailing_start = py_trailing_end - pd.Timedelta(days=PY_TRAILING_DAYS - 1)
-    py_trailing = series.loc[py_trailing_start:py_trailing_end].sum()
+    py_trailing = cleaned_series.loc[py_trailing_start:py_trailing_end].sum()
     if py_trailing <= 0:
         return None, False
-    this_trailing = series.iloc[-PY_TRAILING_DAYS:].sum()
+    this_trailing = cleaned_series.iloc[-PY_TRAILING_DAYS:].sum()
     growth_factor = np.clip(this_trailing / py_trailing, *PY_GROWTH_FACTOR_BOUNDS)
 
     point = np.zeros(horizon)
     for i in range(horizon):
         target_date = last_date + timedelta(days=1 + i)
         py_date = target_date - pd.Timedelta(days=PY_SHIFT_DAYS)
-        window = series.loc[py_date - pd.Timedelta(days=PY_WINDOW_DAYS): py_date + pd.Timedelta(days=PY_WINDOW_DAYS)]
-        py_val = float(window.mean()) if len(window) else 0.0
+        window = lookup_series.loc[py_date - pd.Timedelta(days=PY_WINDOW_DAYS): py_date + pd.Timedelta(days=PY_WINDOW_DAYS)]
+        if len(window) == 0:
+            py_val = 0.0
+        else:
+            event_days = [d for d in window.index if d in event_dates]
+            py_val = float(window.loc[event_days].max()) if event_days else float(window.mean())
         point[i] = max(0.0, py_val * growth_factor)
     return point, True
 
 
-def blend_with_py(series, point, horizon):
+def blend_with_py(cleaned_series, lookup_series, event_dates, point, horizon):
     """Recenters a stage-based fit's point estimate onto the PY-naive seasonal estimate
     where PY history exists, ramping from "trust the fitted model" (day 1, real current
     momentum) to "trust the PY shape" (day 28+, where a damped trend has already gone
     flat and PY is the only remaining source of real signal) over the first 4 weeks."""
-    py_point, has_py = py_naive_forecast(series, horizon)
+    py_point, has_py = py_naive_forecast(cleaned_series, lookup_series, event_dates, horizon)
     if not has_py:
         return point, False
     ramp = np.clip(np.arange(horizon) / 28, 0, 1)
@@ -280,12 +407,13 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
     sellable/daily_velocity_units/daily_run_rate, or None if unavailable (falls back to a
     non-EOL fit even if the checkbox is set, rather than fail outright)."""
     series = reindex_daily(hist_df, today)
-    stage_used = stage_override if stage_override in VALID_STAGES else classify_stage(series)
+    gap_filled, gap_exclusions = detect_and_fill_gaps(series)
+    stage_used = stage_override if stage_override in VALID_STAGES else classify_stage(gap_filled)
 
     if is_end_of_life and eol_inputs and eol_inputs.get("daily_velocity_units", 0) > 0:
         depletion_days = eol_inputs["sellable"] / eol_inputs["daily_velocity_units"]
         point, model_used = eol_forecast(eol_inputs["daily_run_rate"], depletion_days, horizon)
-        std = _volatility(series)
+        std = _volatility(gap_filled)
         point = add_daily_noise(point, std, horizon)
         low, high = band_from_point(point, std, horizon)
         # Noise (and its band) must not leak past the hard sell-out cutoff - once
@@ -296,14 +424,15 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
         high = np.where(past_cutoff, 0.0, high)
         exclusions = []
     else:
-        cleaned, exclusions = strip_outliers(series)
+        cleaned, event_retained, event_dates, spike_exclusions = strip_outliers(gap_filled)
+        exclusions = gap_exclusions + spike_exclusions
         if stage_used == "new":
             point, model_used = fit_new(cleaned, horizon)
         elif stage_used in ("mature", "plateau"):
             point, model_used = fit_ets(cleaned, horizon, seasonal=True)
         else:  # growth, declining
             point, model_used = fit_ets(cleaned, horizon, seasonal=False)
-        point, blended = blend_with_py(cleaned, point, horizon)
+        point, blended = blend_with_py(cleaned, event_retained, event_dates, point, horizon)
         if blended:
             model_used += "+py_blend"
         std = _volatility(cleaned)
