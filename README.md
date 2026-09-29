@@ -29,9 +29,9 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
    `sales_forecast_exclusions` so the tab can show why. A spike that lands inside a known
    recurring Amazon sales-event window (Black Friday/Cyber Monday - calendar-fixed around
    the 4th Thursday of November; Prime Day/Prime Big Deal Days - no fixed date, so a
-   broad July/October window stands in) is tagged as such and its real value is kept
-   around separately for step 5 below, rather than being discarded outright like a random
-   one-off spike (a bulk order, a data glitch) is.
+   broad July/October window stands in; Christmas - December 1-26) is tagged as such and
+   its real value is kept around separately for step 5 below, rather than being discarded
+   outright like a random one-off spike (a bulk order, a data glitch) is.
 4. **Fit a model for that stage** and project 180 days (~6 months) forward:
    - `new` → logistic growth curve (S-shaped ramp toward a ceiling, not a straight line)
    - `growth` / `declining` → damped-trend ETS

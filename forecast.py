@@ -148,12 +148,17 @@ def _nth_weekday_of_month(year, month, weekday, n):
 def event_window_for_date(date):
     """Label if `date` falls in a known recurring Amazon sales-event window, else None.
     Black Friday/Cyber Monday is calendar-fixed (Thu-Mon around the 4th Thursday of
-    November) so this is exact. Prime Day and Prime Big Deal Days have no fixed date
-    (Amazon announces them roughly a month out), so a broad month-wide window stands in
-    for them instead - it may miss a year where the actual date falls outside it, or
+    November) so this is exact. Prime Day, Prime Big Deal Days, and the Christmas
+    gift-shopping run-up have no fixed date (Amazon announces the Prime events roughly a
+    month out; Christmas shopping intensity varies year to year), so a broad window stands
+    in for each instead - it may miss a year where the actual peak falls outside it, or
     loosely tag a few surrounding ordinary days, but the alternative (nothing at all) is
     strictly worse for what this is used for: telling a genuine recurring promotional
-    spike apart from a random one-off outlier."""
+    spike apart from a random one-off outlier, and (via event_retained in strip_outliers)
+    carrying that spike's real value forward into next year's forecast for the same
+    window. Christmas ends the 26th (Boxing Day) rather than the 31st - the gift-shopping
+    demand spike this is meant to catch is over by then, and including the quiet week
+    after would wrongly protect an ordinary low-demand day from outlier stripping."""
     thanksgiving = _nth_weekday_of_month(date.year, 11, 3, 4)
     if thanksgiving <= date <= thanksgiving + pd.Timedelta(days=4):
         return "Black Friday / Cyber Monday"
@@ -161,6 +166,8 @@ def event_window_for_date(date):
         return "Prime Day"
     if pd.Timestamp(year=date.year, month=10, day=1) <= date <= pd.Timestamp(year=date.year, month=10, day=20):
         return "Prime Big Deal Days"
+    if pd.Timestamp(year=date.year, month=12, day=1) <= date <= pd.Timestamp(year=date.year, month=12, day=26):
+        return "Christmas"
     return None
 
 
