@@ -428,19 +428,39 @@ def compute_supply_ratio(sellable, daily_velocity_units, pending, horizon):
 
     `pending`: list of (arrival_day_offset, qty) pairs - units NOT yet in `sellable`,
     expected to become sellable on the given day-out-from-today (0 = today). Callers
-    derive this from in-transit inbound shipments (see pipeline.py's
-    build_pending_by_sku) - units already received must already be counted in `sellable`
-    and must NOT also appear here, or they'd be double-counted.
+    derive this from in-transit inbound shipments, OR, when a SKU is out of stock with no
+    real shipment in the pipeline at all, a single assumed entry at the SKU's configured
+    procurement lead time (see pipeline.py's build_pending_by_sku and
+    apply_out_of_stock_fallback) - units already received must already be counted in
+    `sellable` and must NOT also appear here, or they'd be double-counted.
 
     Unlike the end-of-life cutoff below, this never permanently zeroes a SKU out: once
     enough pending stock arrives to clear a shortfall, the ratio returns to 1.0 and the
     forecast resumes at its normal trajectory - a normal (non-EOL) SKU is expected to keep
-    being restocked, so a temporary supply gap should read as a dip, not a wind-down."""
-    if daily_velocity_units <= 0:
-        return np.ones(horizon)
+    being restocked, so a temporary supply gap should read as a dip, not a wind-down.
+
+    `daily_velocity_units <= 0` (no measurable recent demand - common right after a
+    stockout begins, since the trailing sales windows that feed this figure go quiet)
+    does NOT skip the constraint when `sellable` is ALSO <= 0: physically having zero
+    units on hand means zero revenue is certain regardless of what the demand estimate
+    says, so that combination still gates to 0 until the first pending arrival (full
+    coverage resumes from there - with no demand figure to compute a partial ratio
+    against, this can't scale a gradual recovery the way the velocity>0 path below does).
+    `daily_velocity_units <= 0` WITH `sellable > 0` has nothing to constrain (there's
+    stock, and no measurable demand to run out of it) and returns unconstrained."""
     pending_sorted = sorted(pending, key=lambda p: p[0])
     ratio = np.ones(horizon)
     available = float(sellable)
+    if daily_velocity_units <= 0:
+        if available > 0:
+            return ratio
+        idx = 0
+        for d in range(horizon):
+            while idx < len(pending_sorted) and pending_sorted[idx][0] <= d:
+                available += pending_sorted[idx][1]
+                idx += 1
+            ratio[d] = 0.0 if available <= 0 else 1.0
+        return ratio
     idx = 0
     for d in range(horizon):
         while idx < len(pending_sorted) and pending_sorted[idx][0] <= d:
@@ -531,9 +551,9 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, supply_inpu
         low = np.where(past_cutoff, 0.0, low)
         high = np.where(past_cutoff, 0.0, high)
         model_used += "+eol_cutoff"
-    elif supply_inputs and supply_inputs.get("daily_velocity_units", 0) > 0:
+    elif supply_inputs and not is_end_of_life:
         ratio = compute_supply_ratio(
-            supply_inputs["sellable"], supply_inputs["daily_velocity_units"],
+            supply_inputs["sellable"], supply_inputs.get("daily_velocity_units", 0),
             supply_inputs.get("pending", []), horizon,
         )
         if not np.allclose(ratio, 1.0):

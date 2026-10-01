@@ -141,6 +141,22 @@ def fetch_pending_inbound(conn):
     return pd.read_sql(sql, conn)
 
 
+def fetch_procurement_lead_days(conn):
+    """Per-SKU procurement lead time, Settings -> Procurement (procurement_assumptions),
+    keyed by parent ASIN - or the SKU's own ASIN if it's a standalone listing, same
+    convention react-finance-dashboard's /api/cashflow and /api/procurement-assumptions
+    already use. Used only as a FALLBACK assumed restock horizon for a SKU that's
+    currently out of stock with no real shipment in the pipeline yet - see
+    pipeline.py's out-of-stock handling for why ("assume it's back after the lead time",
+    an explicit stated business assumption, not a prediction)."""
+    sql = """
+        SELECT sp.sku, pa.procurement_lead_days
+        FROM sku_parameters sp
+        JOIN procurement_assumptions pa ON pa.parent_asin = COALESCE(sp.parent_asin, sp.asin)
+    """
+    return pd.read_sql(sql, conn)
+
+
 def write_forecast(conn, rows):
     """rows: list of dicts with sku, forecast_date, forecast_revenue, low_revenue,
     high_revenue, stage_used, model_used. Replaces this run's horizon per SKU rather than

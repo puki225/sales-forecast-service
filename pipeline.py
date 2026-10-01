@@ -121,6 +121,25 @@ def build_pending_by_sku(pending_df):
     return out
 
 
+def apply_out_of_stock_fallback(sellable, pending, lead_days):
+    """A SKU that's out of stock (sellable <= 0) with no real shipment in the pipeline
+    yet (`pending` empty) would otherwise forecast as stocked out for the ENTIRE horizon,
+    forever, since compute_supply_ratio has nothing telling it when supply resumes - which
+    reads as "will never sell again," not the intended "will sell again once reordered."
+    Rather than guess a quantity (there's no real PO to base one on), this assumes FULL
+    demand resumes at the SKU's configured procurement lead time (Settings ->
+    Procurement) - "if we ordered today, it'd take this long" - by injecting a single
+    fallback pending entry with an effectively unlimited quantity at that day, reusing
+    compute_supply_ratio's own simulation rather than a separate code path. Returns
+    `pending` unchanged whenever it doesn't apply (already has a real shipment, is
+    actually in stock, or has no configured lead time to assume one from - in that last
+    case there's genuinely no basis for a resume date, so the SKU correctly stays
+    stocked-out for the full horizon rather than silently guessing one)."""
+    if sellable > 0 or pending or not lead_days or lead_days <= 0:
+        return pending
+    return [(lead_days, float("inf"))]
+
+
 def run(conn):
     today = pd.Timestamp(datetime.now(timezone.utc).date())
     min_date = (today - pd.Timedelta(days=HISTORY_LOOKBACK_DAYS)).date()
@@ -132,6 +151,7 @@ def run(conn):
     seasonal_velocity = {sku: {"sellable": float(row["sellable"] or 0), "daily_velocity_units": _seasonal_velocity(row)}
                           for sku, row in supply_raw.iterrows()}
     pending_by_sku = build_pending_by_sku(db.fetch_pending_inbound(conn))
+    lead_days_by_sku = dict(db.fetch_procurement_lead_days(conn).itertuples(index=False, name=None))
     catalog_index = build_catalog_seasonal_index(daily, config, today, HORIZON_DAYS)
 
     all_forecast_rows = []
@@ -156,7 +176,14 @@ def run(conn):
         # Every SKU gets its supply inputs now, not just end-of-life ones - run_for_sku
         # picks the hard EOL cutoff vs. the day-by-day restock simulation based on is_eol.
         base = seasonal_velocity.get(sku)
-        supply_inputs = {**base, "pending": pending_by_sku.get(sku, [])} if base else None
+        pending = pending_by_sku.get(sku, [])
+        if not is_eol:
+            # EOL deliberately never gets this (or any pending shipment) - see
+            # apply_out_of_stock_fallback's and run_for_sku's own docstrings for why.
+            pending = apply_out_of_stock_fallback(
+                base["sellable"] if base else 0, pending, lead_days_by_sku.get(sku),
+            )
+        supply_inputs = {**base, "pending": pending} if base else None
 
         try:
             rows, exclusions, stage_used = fc.run_for_sku(

@@ -108,6 +108,26 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
      those numbers directly in `pipeline.py` if real lead times for this account turn out
      to run meaningfully different.
 
+     **Out of stock with no shipment yet**: a SKU at `sellable = 0` with nothing in the
+     inbound-shipments pipeline would otherwise forecast 0 for the ENTIRE horizon forever
+     (there's nothing telling the simulation when supply resumes) - reading as "this will
+     never sell again" rather than the intended "this will sell again once reordered."
+     Instead, `pipeline.apply_out_of_stock_fallback` assumes **full demand resumes at the
+     SKU's configured procurement lead time** (Settings → Procurement,
+     `procurement_assumptions.procurement_lead_days`) - "if we reordered today, it'd take
+     this long" - another explicit stated assumption, not a prediction. A real shipment
+     once one exists always takes over from this (its own status-based arrival estimate
+     replaces the lead-time guess the moment it's synced). A SKU with no configured lead
+     time either genuinely has no basis for a resume date and correctly stays
+     stocked-out for the full forecast horizon rather than guessing one.
+
+     This also closes a related gap: a SKU that's been out of stock long enough for its
+     own trailing sales windows to go quiet computes `daily_velocity_units = 0` - that
+     used to skip the supply constraint entirely (nothing to divide by), letting the
+     underlying revenue-trend fit show a forecast with no awareness that zero units are
+     on hand. Zero stock now still gates to 0 regardless of what the velocity figure
+     says, since physically having nothing to sell makes zero revenue certain either way.
+
    A SKU with no usable sellable/velocity figures at all (neither end-of-life nor
    supply-constrained) forecasts exactly like before this existed, uncapped - there's
    nothing to constrain against.
@@ -130,6 +150,9 @@ historically; this only projects the top-line number forward.
   config reads (`server/index.js`) - copy the exact same values over from that service.
   This service reads `v_sku_revenue`, `v_refunds_by_date`, `vat_divisor()`,
   `amazon_order_lines`/`amazon_orders`, `amazon_inventory_snapshots`, `sku_forecast_config`,
+  `procurement_assumptions` (react-finance-dashboard's Settings → Procurement - only used
+  as the out-of-stock-with-no-shipment fallback lead time, see step 7 above; a SKU with no
+  row there just has no fallback to use),
   `amazon_inbound_shipments`/`amazon_inbound_shipment_items` (required - like every other
   table this service reads, it's assumed to already exist; `db.fetch_pending_inbound()`
   doesn't catch a missing-table error, so run `amazon-spapi-proxy`'s setup SQL for these
