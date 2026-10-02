@@ -525,8 +525,19 @@ def find_unresolved_depletion_day(sellable, daily_velocity_units, pending, horiz
     return None
 
 
-def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, supply_inputs, horizon=90, catalog_index=None):
-    """Returns (forecast_rows, exclusion_rows, stage_used). supply_inputs is a dict with
+def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, supply_inputs, horizon=90, catalog_index=None, country="UNKNOWN"):
+    """Returns (forecast_rows, exclusion_rows, stage_used). Called once per (sku, country)
+    pair - pipeline.run() groups history by both, so every call here already only ever
+    sees one country's own revenue series in hist_df. There's nothing country-aware inside
+    this function itself: stage classification, outlier stripping, curve fitting and PY
+    blending all just operate on whatever single series they're handed, which is exactly
+    what makes "each country-SKU forecast done independently" true - a country's fit never
+    sees, blends with, or is diluted by another country's numbers for the same SKU.
+    `country` is carried through purely to tag the output rows; stage_override/
+    is_end_of_life/supply_inputs stay SKU-wide (not split by country - see pipeline.py's
+    own docstring for why: inventory is a single shared pool, not partitioned per market).
+
+    supply_inputs is a dict with
     sellable/daily_velocity_units/pending, or None if unavailable (a SKU with no usable
     inventory/velocity figures just forecasts like any other SKU, uncapped - there's
     nothing to constrain against). Used for every SKU now, not just end-of-life ones -
@@ -621,6 +632,7 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, supply_inpu
     forecast_rows = [
         {
             "sku": sku,
+            "country": country,
             "forecast_date": (today + timedelta(days=i)).date(),
             "forecast_revenue": round(float(point[i]), 2),
             "low_revenue": round(float(low[i]), 2),
@@ -632,7 +644,7 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, supply_inpu
         for i in range(horizon)
     ]
     exclusion_rows = [
-        {"sku": sku, "excluded_date": e["date"].date(), "reason": e["reason"]}
+        {"sku": sku, "country": country, "excluded_date": e["date"].date(), "reason": e["reason"]}
         for e in exclusions
     ]
     return forecast_rows, exclusion_rows, stage_used

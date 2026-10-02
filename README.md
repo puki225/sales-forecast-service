@@ -8,8 +8,23 @@ call it on a schedule; this service has no scheduler of its own.
 
 ## What it does
 
-Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of discounts
-**and** refunds - the same figure the dashboard calls "net revenue" everywhere else):
+Per **(SKU, country)** pair, over roughly the last 2 years of `net revenue` (order revenue
+net of discounts **and** refunds - the same figure the dashboard calls "net revenue"
+everywhere else). `country` is the order's shipping country (unified across Amazon/
+Shopify by `v_sku_revenue`), or `'UNKNOWN'` for a sale whose country wasn't captured by
+the sync (common on this account's Amazon side today - not an error, just a real group of
+its own rather than being dropped). Every step below - stage classification, outlier
+stripping, curve fit, PY/catalog seasonality - runs independently per (SKU, country): a
+country's fit never sees, blends with, or is diluted by another country's numbers for the
+same SKU, so the same SKU can genuinely be `new` in one market and `mature` in another.
+The one exception is **supply** (step 7) - sellable stock, pending shipments, and
+procurement lead time all stay SKU-wide, deliberately not split by country, because this
+account's inventory model has no per-country pool to split from (FBA stock is one shared
+pool regardless of which marketplaces a SKU sells on): if a SKU runs out, every country
+selling it is capped by the exact same constraint, computed once per SKU and applied
+identically to each of its country-series. `stage_override`/end-of-life (the Settings ->
+per-SKU manual config) are SKU-wide for the same reason - winding a product down is a
+decision about the product, not about one market it happens to sell into.
 
 1. **Fill supply-shortage gaps** - a run of 14+ consecutive £0 days (a stockout, not just
    quiet demand) gets replaced, for fitting purposes only, with a straight-line estimate
@@ -58,10 +73,14 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
      forecast to sell well on the equivalent date this year too, rather than that day
      quietly reverting to baseline the way a straight damped-trend fit would.
    - Below 380 days, there's no PY comparison of this SKU's own to blend with - but a
-     **catalog-wide seasonal index**, built once per run from every SKU that *does* clear
-     380 days (`pipeline.build_catalog_seasonal_index` - excluding end-of-life SKUs, whose
-     current trajectory is an intentional wind-down, not representative demand), applies
-     instead when one is available: each contributing SKU's own PY-implied point is
+     **catalog-wide seasonal index, built separately per country**, from every (SKU,
+     country) series in that same country that *does* clear 380 days
+     (`pipeline.build_catalog_seasonal_index`, called once per country - excluding
+     end-of-life SKUs, whose current trajectory is an intentional wind-down, not
+     representative demand), applies instead when one is available for that country -
+     deliberately not blended across markets, since real seasonality (Black Friday
+     participation, Prime Day timing, local holidays) genuinely differs by country. Each
+     contributing series' own PY-implied point is
      measured as a multiple of its own recent 28-day baseline, and those multiples are
      averaged **equal-weighted** across contributors - deliberately not revenue-weighted,
      since revenue-weighting is exactly what made the catalog look falsely flat before this
@@ -144,11 +163,14 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
    A SKU with no usable sellable/velocity figures at all (neither end-of-life nor
    supply-constrained) forecasts exactly like before this existed, uncapped - there's
    nothing to constrain against.
-8. Writes `forecast_revenue` + that band per day, replacing that SKU's previous forecast
-   rows.
+8. Writes `forecast_revenue` + that band per day, replacing that (SKU, country) pair's
+   previous forecast rows - a re-run for one country never touches another country's rows
+   for the same SKU.
 
-A SKU with no sale in the last 180 days is skipped (dormant/delisted), unless the user has
-explicitly configured it (an override or the end-of-life flag). Note this is a *trailing*
+A (SKU, country) pair with no sale in the last 180 days is skipped (dormant/delisted),
+unless the user has explicitly configured it (an override or the end-of-life flag, both
+SKU-wide so they apply regardless of which country triggered the skip check). Note this is
+a *trailing*
 window check against the raw data, independent of step 1's gap-fill (which only touches
 enclosed historical gaps) - a SKU still mid-shortage today with no resolution yet in the
 data stays correctly excluded here rather than silently forecast as if it were selling.

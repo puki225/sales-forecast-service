@@ -33,15 +33,27 @@ CATALOG_INDEX_CLIP = (0.1, 10.0)  # bounds each SKU's own contributed ratio befo
 def build_catalog_seasonal_index(daily, config, today, horizon):
     """A length-`horizon` array: at each day out, how many times a typical SKU's own
     recent baseline the catalog as a whole tends to sell on that calendar date - built
-    from every SKU with enough history for its own PY comparison (same PY_MIN_HISTORY_DAYS
-    gate run_for_sku already applies), equal-weighted across contributors rather than
-    revenue-weighted, so the SKU that happens to be the single biggest earner doesn't
-    define "typical" seasonality for everyone else - it's exactly a few large SKUs
-    dominating a plain revenue-summed view that made the whole catalog look artificially
-    flat before this existed. End-of-life SKUs are excluded from contributing: their
-    current trajectory is an intentional wind-down, not representative demand. Returns
-    None if no SKU qualifies (e.g. an entirely new catalog) - callers should treat that as
-    "no catalog signal available" and fall back to whatever they'd otherwise do."""
+    from every (sku, country) series with enough history for its own PY comparison (same
+    PY_MIN_HISTORY_DAYS gate run_for_sku already applies), equal-weighted across
+    contributors rather than revenue-weighted, so the SKU/country that happens to be the
+    single biggest earner doesn't define "typical" seasonality for everyone else - it's
+    exactly a few large contributors dominating a plain revenue-summed view that made the
+    whole catalog look artificially flat before this existed.
+
+    `daily` is expected to already be scoped to the ONE country this index is being built
+    for (pipeline.run() calls this once per country, on the country's own slice of the
+    history) - seasonality genuinely differs by market (different Black Friday
+    participation, different Prime Day timing, different public holidays), so a young
+    SKU's borrowed "typical shape" should come from its own country's catalog, not a
+    blend across every market the business sells into. stage_override/is_end_of_life stay
+    SKU-wide (config is sku-indexed, not sku+country), matching run_for_sku's own
+    SKU-wide treatment of those two.
+
+    End-of-life SKUs are excluded from contributing: their current trajectory is an
+    intentional wind-down, not representative demand. Returns None if no series qualifies
+    (e.g. an entirely new catalog, or a country with too little history of its own yet) -
+    callers should treat that as "no catalog signal available for this country" and fall
+    back to whatever they'd otherwise do."""
     ratios = []
     for sku, df_sku in daily.groupby("sku"):
         df_sku = df_sku[df_sku["date"] < today]
@@ -149,6 +161,26 @@ def apply_replenishment_assumption(sellable, daily_velocity_units, pending, lead
 
 
 def run(conn):
+    """Each (sku, country) pair gets its own, fully independent forecast - stage
+    classification, outlier stripping, curve fit, and PY/catalog seasonality blend are all
+    computed from that pair's OWN revenue series alone, never blended with or diluted by
+    another country's numbers for the same SKU (see forecast.run_for_sku's own docstring).
+    `country` is db.fetch_daily_revenue's per-order shipping_country, COALESCEd to
+    'UNKNOWN' for the (currently common, Amazon-sync-dependent) case where it wasn't
+    captured - kept as its own real group rather than dropped, so a SKU's sales don't
+    silently vanish from the forecast just because the country happened to not sync.
+
+    Inventory/supply (sellable stock, pending inbound shipments, procurement lead time)
+    stays SKU-wide, deliberately NOT split by country - this account's data model has no
+    per-country inventory pool to split from (FBA stock is a single shared pool across
+    whichever marketplaces a SKU sells on), so the same supply constraint is computed once
+    per SKU and applied identically to every one of that SKU's country-series: if a SKU
+    runs out, every country selling it is equally capped, which is the physically correct
+    behavior for pooled stock. stage_override/is_end_of_life (Settings -> per-SKU manual
+    config) are also SKU-wide for the same reason this is already true of supply inputs -
+    a product being wound down is a decision about the product, not about one market it's
+    sold into. Auto-classification (no override set) still runs independently per country,
+    same as everything else."""
     today = pd.Timestamp(datetime.now(timezone.utc).date())
     min_date = (today - pd.Timedelta(days=HISTORY_LOOKBACK_DAYS)).date()
 
@@ -160,29 +192,38 @@ def run(conn):
                           for sku, row in supply_raw.iterrows()}
     pending_by_sku = build_pending_by_sku(db.fetch_pending_inbound(conn))
     lead_days_by_sku = dict(db.fetch_procurement_lead_days(conn).itertuples(index=False, name=None))
-    catalog_index = build_catalog_seasonal_index(daily, config, today, HORIZON_DAYS)
+    # One catalog-wide seasonal index PER COUNTRY, built only from that country's own SKU
+    # series - seasonality genuinely differs by market (see build_catalog_seasonal_index's
+    # own docstring), so a young SKU's borrowed "typical shape" should reflect its own
+    # country's catalog, not a blend across every market the business sells into.
+    catalog_index_by_country = {
+        country: build_catalog_seasonal_index(df_country, config, today, HORIZON_DAYS)
+        for country, df_country in daily.groupby("country")
+    }
 
     all_forecast_rows = []
     all_exclusion_rows = []
-    summary = {"skus_processed": 0, "skus_skipped_inactive": 0, "stages": {}, "end_of_life": 0}
+    summary = {"sku_countries_processed": 0, "sku_countries_skipped_inactive": 0, "stages": {}, "end_of_life": 0}
 
-    for sku, df_sku in daily.groupby("sku"):
-        df_sku = df_sku[df_sku["date"] < today]
-        if df_sku.empty:
+    for (sku, country), df_group in daily.groupby(["sku", "country"]):
+        df_group = df_group[df_group["date"] < today]
+        if df_group.empty:
             continue
 
         cfg = config.loc[sku] if sku in config.index else None
         stage_override = cfg["stage_override"] if cfg is not None else None
         is_eol = bool(cfg["is_end_of_life"]) if cfg is not None else False
 
-        last_sale_age_days = (today - df_sku["date"].max()).days
+        last_sale_age_days = (today - df_group["date"].max()).days
         user_configured = bool(stage_override) or is_eol
         if last_sale_age_days > fc.ACTIVITY_WINDOW_DAYS and not user_configured:
-            summary["skus_skipped_inactive"] += 1
+            summary["sku_countries_skipped_inactive"] += 1
             continue
 
         # Every SKU gets its supply inputs now, not just end-of-life ones - run_for_sku
         # picks the hard EOL cutoff vs. the day-by-day restock simulation based on is_eol.
+        # SKU-wide (not per-country - see this function's own docstring for why), so every
+        # country-series of a given SKU shares the exact same supply_inputs dict.
         base = seasonal_velocity.get(sku)
         pending = pending_by_sku.get(sku, [])
         if not is_eol:
@@ -197,17 +238,18 @@ def run(conn):
 
         try:
             rows, exclusions, stage_used = fc.run_for_sku(
-                sku, df_sku[["date", "revenue"]], today,
+                sku, df_group[["date", "revenue"]], today,
                 stage_override, is_eol, supply_inputs, horizon=HORIZON_DAYS,
-                catalog_index=catalog_index,
+                catalog_index=catalog_index_by_country.get(country),
+                country=country,
             )
         except Exception:
-            logger.exception("Forecast failed for SKU %s - skipping it this run", sku)
+            logger.exception("Forecast failed for SKU %s / country %s - skipping it this run", sku, country)
             continue
 
         all_forecast_rows.extend(rows)
         all_exclusion_rows.extend(exclusions)
-        summary["skus_processed"] += 1
+        summary["sku_countries_processed"] += 1
         summary["stages"][stage_used] = summary["stages"].get(stage_used, 0) + 1
         if is_eol:
             summary["end_of_life"] += 1
