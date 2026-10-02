@@ -29,9 +29,9 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
    `sales_forecast_exclusions` so the tab can show why. A spike that lands inside a known
    recurring Amazon sales-event window (Black Friday/Cyber Monday - calendar-fixed around
    the 4th Thursday of November; Prime Day/Prime Big Deal Days - no fixed date, so a
-   broad July/October window stands in) is tagged as such and its real value is kept
-   around separately for step 5 below, rather than being discarded outright like a random
-   one-off spike (a bulk order, a data glitch) is.
+   broad July/October window stands in; Christmas - December 1-26) is tagged as such and
+   its real value is kept around separately for step 5 below, rather than being discarded
+   outright like a random one-off spike (a bulk order, a data glitch) is.
 4. **Fit a model for that stage** and project 180 days (~6 months) forward:
    - `new` → logistic growth curve (S-shaped ramp toward a ceiling, not a straight line)
    - `growth` / `declining` → damped-trend ETS
@@ -81,15 +81,56 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
    smooth curve sitting under a jagged one. An earlier version computed the band from the
    pre-noise point using each model's own residual std, which decoupled the two badly
    enough that the noisy line routinely poked outside its own band.
-7. **End-of-life depletion cutoff** - the one and only place the end-of-life checkbox
-   changes anything: once projected inventory (`sellable / daily_velocity_units`, the same
-   velocity math `/api/inventory` uses for its "days of inventory left") would run out,
-   `forecast_revenue`/`low_revenue`/`high_revenue` are hard-clipped to 0 from that day
-   forward - no restock assumed, and no noise/band wobble around 0 either. Everything
-   before this point (stage fit, PY/catalog seasonality, noise, band) is untouched -
-   `model_used` just gets a `+eol_cutoff` suffix appended. A SKU flagged end-of-life with
-   no usable sellable/velocity figures forecasts exactly like any other SKU, uncapped -
-   there's nothing to cut off against.
+7. **Supply constraint** - every SKU's projected demand is checked day-by-day against
+   what's actually going to be available to sell, combining current FBA sellable stock
+   with any inbound shipments still in transit (`amazon_inbound_shipments` /
+   `amazon_inbound_shipment_items`, synced by `amazon-spapi-proxy`'s
+   `/sync-inbound-shipments` job). Two different treatments:
+   - **End-of-life** (checkbox on the tab): once projected inventory
+     (`sellable / daily_velocity_units`, the same velocity math `/api/inventory` uses for
+     its "days of inventory left") would run out, `forecast_revenue`/`low_revenue`/
+     `high_revenue` are hard-clipped to 0 from that day forward - no restock assumed
+     (pending inbound shipments are deliberately ignored here), and no noise/band wobble
+     around 0 either. `model_used` gets a `+eol_cutoff` suffix.
+   - **Every other SKU**: sellable stock plus pending inbound (units shipped but not yet
+     received, on a shipment that isn't CLOSED/CANCELLED/DELETED/ERROR) are simulated
+     day-by-day against projected demand. A day where demand exceeds what's actually
+     available gets that day's revenue scaled down (not hard-clipped) - once enough
+     pending stock arrives to clear the shortfall, the forecast returns to its normal
+     trajectory. `model_used` gets a `+supply_constrained` suffix on any SKU where this
+     changed something.
+
+     Amazon's Fulfillment Inbound API essentially never gives a real ETA on this account
+     (`confirmed_need_by_date` comes back null on every shipment synced so far) - lacking
+     that, how much transit time is left is **assumed from the shipment's status alone**
+     (`pipeline.STATUS_REMAINING_DAYS`: 21 days for `WORKING` down to 1 day for
+     `RECEIVING`). This is a stated business assumption, not a measured fact - adjust
+     those numbers directly in `pipeline.py` if real lead times for this account turn out
+     to run meaningfully different.
+
+     **Out of stock with no shipment yet**: a SKU at `sellable = 0` with nothing in the
+     inbound-shipments pipeline would otherwise forecast 0 for the ENTIRE horizon forever
+     (there's nothing telling the simulation when supply resumes) - reading as "this will
+     never sell again" rather than the intended "this will sell again once reordered."
+     Instead, `pipeline.apply_out_of_stock_fallback` assumes **full demand resumes at the
+     SKU's configured procurement lead time** (Settings → Procurement,
+     `procurement_assumptions.procurement_lead_days`) - "if we reordered today, it'd take
+     this long" - another explicit stated assumption, not a prediction. A real shipment
+     once one exists always takes over from this (its own status-based arrival estimate
+     replaces the lead-time guess the moment it's synced). A SKU with no configured lead
+     time either genuinely has no basis for a resume date and correctly stays
+     stocked-out for the full forecast horizon rather than guessing one.
+
+     This also closes a related gap: a SKU that's been out of stock long enough for its
+     own trailing sales windows to go quiet computes `daily_velocity_units = 0` - that
+     used to skip the supply constraint entirely (nothing to divide by), letting the
+     underlying revenue-trend fit show a forecast with no awareness that zero units are
+     on hand. Zero stock now still gates to 0 regardless of what the velocity figure
+     says, since physically having nothing to sell makes zero revenue certain either way.
+
+   A SKU with no usable sellable/velocity figures at all (neither end-of-life nor
+   supply-constrained) forecasts exactly like before this existed, uncapped - there's
+   nothing to constrain against.
 8. Writes `forecast_revenue` + that band per day, replacing that SKU's previous forecast
    rows.
 
@@ -108,8 +149,15 @@ historically; this only projects the top-line number forward.
   `react-finance-dashboard` uses, and the same variable names its Node service's `Pool`
   config reads (`server/index.js`) - copy the exact same values over from that service.
   This service reads `v_sku_revenue`, `v_refunds_by_date`, `vat_divisor()`,
-  `amazon_order_lines`/`amazon_orders`, `amazon_inventory_snapshots`, `sku_forecast_config`
-  and writes `sales_forecast` / `sales_forecast_exclusions`. (A single `DATABASE_URL` is
+  `amazon_order_lines`/`amazon_orders`, `amazon_inventory_snapshots`, `sku_forecast_config`,
+  `procurement_assumptions` (react-finance-dashboard's Settings → Procurement - only used
+  as the out-of-stock-with-no-shipment fallback lead time, see step 7 above; a SKU with no
+  row there just has no fallback to use),
+  `amazon_inbound_shipments`/`amazon_inbound_shipment_items` (required - like every other
+  table this service reads, it's assumed to already exist; `db.fetch_pending_inbound()`
+  doesn't catch a missing-table error, so run `amazon-spapi-proxy`'s setup SQL for these
+  two first if they aren't there yet) and writes `sales_forecast` /
+  `sales_forecast_exclusions`. (A single `DATABASE_URL` is
   also accepted if set, as an alternative - but this account's Railway services use the
   five separate vars, not that.)
 - `API_KEY` - optional. If set, `POST /run` requires header `x-api-key: <API_KEY>`. If

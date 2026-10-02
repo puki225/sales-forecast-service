@@ -148,12 +148,17 @@ def _nth_weekday_of_month(year, month, weekday, n):
 def event_window_for_date(date):
     """Label if `date` falls in a known recurring Amazon sales-event window, else None.
     Black Friday/Cyber Monday is calendar-fixed (Thu-Mon around the 4th Thursday of
-    November) so this is exact. Prime Day and Prime Big Deal Days have no fixed date
-    (Amazon announces them roughly a month out), so a broad month-wide window stands in
-    for them instead - it may miss a year where the actual date falls outside it, or
+    November) so this is exact. Prime Day, Prime Big Deal Days, and the Christmas
+    gift-shopping run-up have no fixed date (Amazon announces the Prime events roughly a
+    month out; Christmas shopping intensity varies year to year), so a broad window stands
+    in for each instead - it may miss a year where the actual peak falls outside it, or
     loosely tag a few surrounding ordinary days, but the alternative (nothing at all) is
     strictly worse for what this is used for: telling a genuine recurring promotional
-    spike apart from a random one-off outlier."""
+    spike apart from a random one-off outlier, and (via event_retained in strip_outliers)
+    carrying that spike's real value forward into next year's forecast for the same
+    window. Christmas ends the 26th (Boxing Day) rather than the 31st - the gift-shopping
+    demand spike this is meant to catch is over by then, and including the quiet week
+    after would wrongly protect an ordinary low-demand day from outlier stripping."""
     thanksgiving = _nth_weekday_of_month(date.year, 11, 3, 4)
     if thanksgiving <= date <= thanksgiving + pd.Timedelta(days=4):
         return "Black Friday / Cyber Monday"
@@ -161,6 +166,8 @@ def event_window_for_date(date):
         return "Prime Day"
     if pd.Timestamp(year=date.year, month=10, day=1) <= date <= pd.Timestamp(year=date.year, month=10, day=20):
         return "Prime Big Deal Days"
+    if pd.Timestamp(year=date.year, month=12, day=1) <= date <= pd.Timestamp(year=date.year, month=12, day=26):
+        return "Christmas"
     return None
 
 
@@ -410,11 +417,68 @@ def band_from_point(point, std, horizon):
     return low, high
 
 
-def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs, horizon=90, catalog_index=None):
-    """Returns (forecast_rows, exclusion_rows, stage_used). eol_inputs is a dict with
-    sellable/daily_velocity_units, or None if unavailable (an end-of-life SKU with no
-    usable inventory/velocity figures just forecasts like any other SKU, uncapped - there's
-    nothing to cut off against).
+def compute_supply_ratio(sellable, daily_velocity_units, pending, horizon):
+    """Day-by-day supply-vs-demand simulation for a NON-end-of-life SKU: returns a
+    length-`horizon` array of multipliers in [0, 1], one per forecast day, applied to that
+    day's point/low/high revenue. 1.0 means projected demand that day was fully coverable
+    from on-hand + already-arrived pending stock; a lower value means demand exceeded what
+    was available (a stockout/undersupply day) - unmet demand is NOT backfilled onto a
+    later day (a customer who couldn't buy today isn't assumed to buy double tomorrow, so
+    a bad supply gap is a real lost-sales dip, not just a deferred one).
+
+    `pending`: list of (arrival_day_offset, qty) pairs - units NOT yet in `sellable`,
+    expected to become sellable on the given day-out-from-today (0 = today). Callers
+    derive this from in-transit inbound shipments, OR, when a SKU is out of stock with no
+    real shipment in the pipeline at all, a single assumed entry at the SKU's configured
+    procurement lead time (see pipeline.py's build_pending_by_sku and
+    apply_out_of_stock_fallback) - units already received must already be counted in
+    `sellable` and must NOT also appear here, or they'd be double-counted.
+
+    Unlike the end-of-life cutoff below, this never permanently zeroes a SKU out: once
+    enough pending stock arrives to clear a shortfall, the ratio returns to 1.0 and the
+    forecast resumes at its normal trajectory - a normal (non-EOL) SKU is expected to keep
+    being restocked, so a temporary supply gap should read as a dip, not a wind-down.
+
+    `daily_velocity_units <= 0` (no measurable recent demand - common right after a
+    stockout begins, since the trailing sales windows that feed this figure go quiet)
+    does NOT skip the constraint when `sellable` is ALSO <= 0: physically having zero
+    units on hand means zero revenue is certain regardless of what the demand estimate
+    says, so that combination still gates to 0 until the first pending arrival (full
+    coverage resumes from there - with no demand figure to compute a partial ratio
+    against, this can't scale a gradual recovery the way the velocity>0 path below does).
+    `daily_velocity_units <= 0` WITH `sellable > 0` has nothing to constrain (there's
+    stock, and no measurable demand to run out of it) and returns unconstrained."""
+    pending_sorted = sorted(pending, key=lambda p: p[0])
+    ratio = np.ones(horizon)
+    available = float(sellable)
+    if daily_velocity_units <= 0:
+        if available > 0:
+            return ratio
+        idx = 0
+        for d in range(horizon):
+            while idx < len(pending_sorted) and pending_sorted[idx][0] <= d:
+                available += pending_sorted[idx][1]
+                idx += 1
+            ratio[d] = 0.0 if available <= 0 else 1.0
+        return ratio
+    idx = 0
+    for d in range(horizon):
+        while idx < len(pending_sorted) and pending_sorted[idx][0] <= d:
+            available += pending_sorted[idx][1]
+            idx += 1
+        sellable_today = min(daily_velocity_units, max(available, 0.0))
+        ratio[d] = sellable_today / daily_velocity_units
+        available -= sellable_today
+    return ratio
+
+
+def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, supply_inputs, horizon=90, catalog_index=None):
+    """Returns (forecast_rows, exclusion_rows, stage_used). supply_inputs is a dict with
+    sellable/daily_velocity_units/pending, or None if unavailable (a SKU with no usable
+    inventory/velocity figures just forecasts like any other SKU, uncapped - there's
+    nothing to constrain against). Used for every SKU now, not just end-of-life ones -
+    see the two branches near the bottom of this function for how each is treated
+    differently.
 
     catalog_index, if given, is a length-`horizon` array: at each day out, how many times
     a SKU's own recent baseline the CATALOG as a whole tends to sell on that calendar date
@@ -429,7 +493,16 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
     every other SKU - a SKU nearing its last units still sees a real Black Friday, so
     there's no reason to forecast it flat. The only difference: once projected inventory
     (same velocity/sellable figures the Inventory tab uses) would run out, sales stop
-    abruptly - point/low/high hard-clipped to 0 from that day on, no restock assumed."""
+    abruptly - point/low/high hard-clipped to 0 from that day on, no restock assumed
+    (pending inbound shipments are deliberately ignored for this case - a SKU the user has
+    flagged end-of-life is being wound down on purpose).
+
+    Every other (non-EOL) SKU instead gets compute_supply_ratio() above: sellable stock
+    plus any pending inbound shipments (in transit, not yet received - see
+    pipeline.build_pending_by_sku) are simulated day-by-day against projected demand, and
+    a day where demand would exceed what's actually available gets its revenue scaled
+    down rather than hard-clipped - the forecast dips through a stock-out gap and recovers
+    once incoming supply lands, rather than assuming the SKU stops selling for good."""
     series = reindex_daily(hist_df, today)
     gap_filled, gap_dates, gap_exclusions = detect_and_fill_gaps(series)
     stage_used = stage_override if stage_override in VALID_STAGES else classify_stage(gap_filled)
@@ -469,8 +542,8 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
     point = add_daily_noise(point, std, horizon)
     low, high = band_from_point(point, std, horizon)
 
-    if is_end_of_life and eol_inputs and eol_inputs.get("daily_velocity_units", 0) > 0:
-        depletion_days = eol_inputs["sellable"] / eol_inputs["daily_velocity_units"]
+    if is_end_of_life and supply_inputs and supply_inputs.get("daily_velocity_units", 0) > 0:
+        depletion_days = supply_inputs["sellable"] / supply_inputs["daily_velocity_units"]
         # Noise (and its band) must not leak past the hard sell-out cutoff - once
         # inventory is gone, revenue is exactly 0, not a small random wobble around 0.
         past_cutoff = np.arange(horizon) >= depletion_days
@@ -478,6 +551,18 @@ def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, eol_inputs,
         low = np.where(past_cutoff, 0.0, low)
         high = np.where(past_cutoff, 0.0, high)
         model_used += "+eol_cutoff"
+    elif supply_inputs and not is_end_of_life:
+        ratio = compute_supply_ratio(
+            supply_inputs["sellable"], supply_inputs.get("daily_velocity_units", 0),
+            supply_inputs.get("pending", []), horizon,
+        )
+        if not np.allclose(ratio, 1.0):
+            # Same reasoning as the EOL cutoff above: a constrained day's noise/band must
+            # scale down with it too, not wobble around a point the day can't actually reach.
+            point = point * ratio
+            low = low * ratio
+            high = high * ratio
+            model_used += "+supply_constrained"
 
     generated_at = pd.Timestamp.utcnow()
     forecast_rows = [

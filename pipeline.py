@@ -68,11 +68,12 @@ def build_catalog_seasonal_index(daily, config, today, horizon):
     return np.mean(ratios, axis=0)
 
 
-def _eol_velocity(row):
+def _seasonal_velocity(row):
     """Same PY-seasonal-adjusted velocity formula as /api/inventory's "days of inventory
     left" figure (server/index.js, GET /api/inventory) - ported here rather than shared,
-    so a SKU's end-of-life depletion date agrees with what the Inventory tab already says
-    about it instead of computing a second, disagreeing answer from different logic."""
+    so the supply-constrained forecast (end-of-life depletion, or the general stock-out
+    simulation below) agrees with what the Inventory tab already says about a SKU instead
+    of computing a second, disagreeing answer from different logic."""
     cy, py_trailing, py_forward = row["cy_trailing_units"], row["py_trailing_units"], row["py_forward_units"]
     if py_forward > 0:
         growth = (cy - py_trailing) / py_trailing if py_trailing > 0 else 0.0
@@ -82,6 +83,63 @@ def _eol_velocity(row):
     return 0.0
 
 
+# ── Pending-inbound supply constraint ──────────────────────────────────────────────────
+# Amazon's Fulfillment Inbound API gives a shipment's STATUS but essentially never a real
+# ETA on this account - confirmed_need_by_date comes back null on every shipment synced so
+# far (see amazon-spapi-proxy's own sync code for the same finding). Lacking a real date,
+# how much transit time is LEFT is ASSUMED from status alone below - a rough, clearly-
+# flagged business assumption, not a measured fact, and the one place in this whole
+# pipeline that isn't derived from real data. If actual lead times for this account turn
+# out to run meaningfully longer or shorter than this, adjust these numbers - there's
+# nothing else to tune.
+STATUS_REMAINING_DAYS = {
+    "WORKING": 21,      # still being prepared/labeled - furthest from arrival
+    "SHIPPED": 14,      # label created, early transit
+    "IN_TRANSIT": 7,    # en route to the fulfillment center
+    "DELIVERED": 3,     # arrived at the FC, awaiting check-in
+    "CHECKED_IN": 2,    # checked in, awaiting receiving
+    "RECEIVING": 1,     # actively being counted in - imminent
+    # CLOSED/CANCELLED/DELETED/ERROR intentionally absent - db.fetch_pending_inbound()
+    # already excludes them (CLOSED = fully received, already counted in `sellable`; the
+    # other three mean the units are never coming).
+}
+
+
+def build_pending_by_sku(pending_df):
+    """pending_df: columns [sku, shipment_status, pending_qty] from
+    db.fetch_pending_inbound(). Returns {sku: [(day_offset, qty), ...]} - the `pending`
+    input forecast.compute_supply_ratio() expects. One entry per (sku, status) group
+    rather than per individual shipment - multiple shipments of the same SKU sitting at
+    the same status are assumed to land around the same time, which is close enough for a
+    day-level simulation over a 180-day horizon."""
+    out = {}
+    for row in pending_df.itertuples():
+        days = STATUS_REMAINING_DAYS.get(row.shipment_status)
+        if days is None or row.pending_qty <= 0:
+            continue
+        out.setdefault(row.sku, []).append((days, float(row.pending_qty)))
+    return out
+
+
+def apply_out_of_stock_fallback(sellable, pending, lead_days):
+    """A SKU that's out of stock (sellable <= 0) with no real shipment in the pipeline
+    yet (`pending` empty) would otherwise forecast as stocked out for the ENTIRE horizon,
+    forever, since compute_supply_ratio has nothing telling it when supply resumes - which
+    reads as "will never sell again," not the intended "will sell again once reordered."
+    Rather than guess a quantity (there's no real PO to base one on), this assumes FULL
+    demand resumes at the SKU's configured procurement lead time (Settings ->
+    Procurement) - "if we ordered today, it'd take this long" - by injecting a single
+    fallback pending entry with an effectively unlimited quantity at that day, reusing
+    compute_supply_ratio's own simulation rather than a separate code path. Returns
+    `pending` unchanged whenever it doesn't apply (already has a real shipment, is
+    actually in stock, or has no configured lead time to assume one from - in that last
+    case there's genuinely no basis for a resume date, so the SKU correctly stays
+    stocked-out for the full horizon rather than silently guessing one)."""
+    if sellable > 0 or pending or not lead_days or lead_days <= 0:
+        return pending
+    return [(lead_days, float("inf"))]
+
+
 def run(conn):
     today = pd.Timestamp(datetime.now(timezone.utc).date())
     min_date = (today - pd.Timedelta(days=HISTORY_LOOKBACK_DAYS)).date()
@@ -89,9 +147,11 @@ def run(conn):
     daily = db.fetch_daily_revenue(conn, min_date)
     daily["date"] = pd.to_datetime(daily["date"])
     config = db.fetch_sku_config(conn).set_index("sku")
-    eol_raw = db.fetch_eol_inputs(conn).set_index("sku")
-    eol_velocity = {sku: {"sellable": float(row["sellable"] or 0), "daily_velocity_units": _eol_velocity(row)}
-                     for sku, row in eol_raw.iterrows()}
+    supply_raw = db.fetch_supply_inputs(conn).set_index("sku")
+    seasonal_velocity = {sku: {"sellable": float(row["sellable"] or 0), "daily_velocity_units": _seasonal_velocity(row)}
+                          for sku, row in supply_raw.iterrows()}
+    pending_by_sku = build_pending_by_sku(db.fetch_pending_inbound(conn))
+    lead_days_by_sku = dict(db.fetch_procurement_lead_days(conn).itertuples(index=False, name=None))
     catalog_index = build_catalog_seasonal_index(daily, config, today, HORIZON_DAYS)
 
     all_forecast_rows = []
@@ -113,12 +173,22 @@ def run(conn):
             summary["skus_skipped_inactive"] += 1
             continue
 
-        eol_inputs = eol_velocity.get(sku) if is_eol else None
+        # Every SKU gets its supply inputs now, not just end-of-life ones - run_for_sku
+        # picks the hard EOL cutoff vs. the day-by-day restock simulation based on is_eol.
+        base = seasonal_velocity.get(sku)
+        pending = pending_by_sku.get(sku, [])
+        if not is_eol:
+            # EOL deliberately never gets this (or any pending shipment) - see
+            # apply_out_of_stock_fallback's and run_for_sku's own docstrings for why.
+            pending = apply_out_of_stock_fallback(
+                base["sellable"] if base else 0, pending, lead_days_by_sku.get(sku),
+            )
+        supply_inputs = {**base, "pending": pending} if base else None
 
         try:
             rows, exclusions, stage_used = fc.run_for_sku(
                 sku, df_sku[["date", "revenue"]], today,
-                stage_override, is_eol, eol_inputs, horizon=HORIZON_DAYS,
+                stage_override, is_eol, supply_inputs, horizon=HORIZON_DAYS,
                 catalog_index=catalog_index,
             )
         except Exception:

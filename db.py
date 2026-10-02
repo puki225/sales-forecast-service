@@ -68,12 +68,16 @@ def fetch_sku_config(conn):
     return pd.read_sql(sql, conn)
 
 
-def fetch_eol_inputs(conn):
-    """Everything the end-of-life depletion model needs, in one query: current FBA
-    sellable stock, and the same seasonal-velocity inputs /api/inventory uses for its
-    "days of inventory left" figure - so a SKU's forecast tapering to zero lines up with
-    what the Inventory tab already says about it, instead of computing a second,
-    disagreeing answer. Amazon/FBA-only, matching the Inventory tab's own scope."""
+def fetch_supply_inputs(conn):
+    """Everything the supply-constrained forecast (end-of-life depletion, and the general
+    stock-out simulation for every other SKU) needs, in one query: current FBA sellable
+    stock, and the same seasonal-velocity inputs /api/inventory uses for its "days of
+    inventory left" figure - so a SKU's forecast agrees with what the Inventory tab
+    already says about it, instead of computing a second, disagreeing answer.
+    Amazon/FBA-only, matching the Inventory tab's own scope. Covers every SKU with a
+    current inventory snapshot, not just end-of-life ones - pipeline.py decides per SKU
+    which of the two supply-constraint branches (hard EOL cutoff vs. the day-by-day
+    restock simulation) applies."""
     sql = """
         WITH latest_inv AS (
           SELECT DISTINCT ON (sku) sku, fulfillable_quantity::int AS sellable
@@ -111,6 +115,44 @@ def fetch_eol_inputs(conn):
         LEFT JOIN cy_trailing cy ON cy.sku = li.sku
         LEFT JOIN py_trailing pyt ON pyt.sku = li.sku
         LEFT JOIN py_forward pyf ON pyf.sku = li.sku
+    """
+    return pd.read_sql(sql, conn)
+
+
+def fetch_pending_inbound(conn):
+    """Units already shipped but not yet fully received, grouped by SKU and shipment
+    status - the raw input pipeline.build_pending_by_sku() turns into an assumed arrival
+    schedule for the supply-constrained forecast (see its own docstring for how a status
+    maps to an assumed remaining-transit time - there's no reliable per-shipment ETA on
+    this account to use instead, confirmed via a live sync: confirmed_need_by_date comes
+    back null). CLOSED/CANCELLED/DELETED/ERROR shipments are excluded: CLOSED means fully
+    received (already reflected in fetch_supply_inputs' `sellable`), the other three mean
+    the units are never coming."""
+    sql = """
+        SELECT i.sku, s.shipment_status,
+          SUM(GREATEST(i.quantity_shipped - i.quantity_received, 0))::int AS pending_qty
+        FROM amazon_inbound_shipment_items i
+        JOIN amazon_inbound_shipments s ON s.shipment_id = i.shipment_id
+        WHERE s.shipment_status NOT IN ('CLOSED', 'CANCELLED', 'DELETED', 'ERROR')
+          AND i.sku IS NOT NULL
+        GROUP BY i.sku, s.shipment_status
+        HAVING SUM(GREATEST(i.quantity_shipped - i.quantity_received, 0)) > 0
+    """
+    return pd.read_sql(sql, conn)
+
+
+def fetch_procurement_lead_days(conn):
+    """Per-SKU procurement lead time, Settings -> Procurement (procurement_assumptions),
+    keyed by parent ASIN - or the SKU's own ASIN if it's a standalone listing, same
+    convention react-finance-dashboard's /api/cashflow and /api/procurement-assumptions
+    already use. Used only as a FALLBACK assumed restock horizon for a SKU that's
+    currently out of stock with no real shipment in the pipeline yet - see
+    pipeline.py's out-of-stock handling for why ("assume it's back after the lead time",
+    an explicit stated business assumption, not a prediction)."""
+    sql = """
+        SELECT sp.sku, pa.procurement_lead_days
+        FROM sku_parameters sp
+        JOIN procurement_assumptions pa ON pa.parent_asin = COALESCE(sp.parent_asin, sp.asin)
     """
     return pd.read_sql(sql, conn)
 
