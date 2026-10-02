@@ -92,13 +92,22 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
      `high_revenue` are hard-clipped to 0 from that day forward - no restock assumed
      (pending inbound shipments are deliberately ignored here), and no noise/band wobble
      around 0 either. `model_used` gets a `+eol_cutoff` suffix.
-   - **Every other SKU**: sellable stock plus pending inbound (units shipped but not yet
-     received, on a shipment that isn't CLOSED/CANCELLED/DELETED/ERROR) are simulated
-     day-by-day against projected demand. A day where demand exceeds what's actually
-     available gets that day's revenue scaled down (not hard-clipped) - once enough
-     pending stock arrives to clear the shortfall, the forecast returns to its normal
-     trajectory. `model_used` gets a `+supply_constrained` suffix on any SKU where this
-     changed something.
+   - **Every other SKU**: the DEFAULT is to assume ongoing replenishment keeps pace
+     indefinitely - `forecast.compute_supply_ratio` does NOT simulate current stock
+     running down with no future reorders ever assumed (that would eventually, and
+     wrongly, flag almost every actively-selling SKU as running out somewhere within a
+     long enough horizon, just because nothing's been ordered *yet* - there's no need to
+     yet). It only ever constrains when there's something concrete to react to:
+     - A real shipment already in the pipeline (pending inbound - units shipped but not
+       yet received, on a shipment that isn't CLOSED/CANCELLED/DELETED/ERROR): sellable
+       stock plus that pending inbound are simulated day-by-day against projected demand.
+       A day where demand exceeds what's actually available gets that day's revenue
+       scaled down (not hard-clipped) - once enough pending stock arrives to clear the
+       shortfall, the forecast returns to its normal trajectory.
+     - Genuinely zero stock on hand today (`sellable <= 0`).
+
+     `model_used` gets a `+supply_constrained` suffix on any SKU where this changed
+     something.
 
      Amazon's Fulfillment Inbound API essentially never gives a real ETA on this account
      (`confirmed_need_by_date` comes back null on every shipment synced so far) - lacking
@@ -108,18 +117,22 @@ Per SKU, over roughly the last 2 years of `net revenue` (order revenue net of di
      those numbers directly in `pipeline.py` if real lead times for this account turn out
      to run meaningfully different.
 
-     **Out of stock with no shipment yet**: a SKU at `sellable = 0` with nothing in the
-     inbound-shipments pipeline would otherwise forecast 0 for the ENTIRE horizon forever
-     (there's nothing telling the simulation when supply resumes) - reading as "this will
-     never sell again" rather than the intended "this will sell again once reordered."
-     Instead, `pipeline.apply_out_of_stock_fallback` assumes **full demand resumes at the
-     SKU's configured procurement lead time** (Settings → Procurement,
-     `procurement_assumptions.procurement_lead_days`) - "if we reordered today, it'd take
-     this long" - another explicit stated assumption, not a prediction. A real shipment
-     once one exists always takes over from this (its own status-based arrival estimate
-     replaces the lead-time guess the moment it's synced). A SKU with no configured lead
-     time either genuinely has no basis for a resume date and correctly stays
-     stocked-out for the full forecast horizon rather than guessing one.
+     **A SKU that genuinely runs dry with nothing resolving it** - whether that's zero
+     stock *today* with no shipment, or current stock + a real (but insufficient)
+     shipment that still runs out later with nothing further known - would otherwise
+     forecast 0 for the rest of the horizon forever past that point (there's nothing
+     telling the simulation when supply resumes), reading as "this will never sell
+     again" rather than the intended "this will sell again once reordered."
+     `pipeline.apply_replenishment_assumption` (using `fc.find_unresolved_depletion_day`
+     to find exactly where real data stops covering demand) assumes **full demand
+     resumes at the SKU's configured procurement lead time, counted from that real
+     depletion day** (Settings → Procurement, `procurement_assumptions.
+     procurement_lead_days`) - "if we reordered as it ran low, it'd take this long" -
+     another explicit stated assumption, not a prediction. A real shipment, once one
+     exists, always takes over from this (its own status-based arrival estimate replaces
+     the lead-time guess the moment it's synced). A SKU with no configured lead time has
+     no basis for a resume date and correctly stays reflecting the real, unresolved
+     gap instead of a guessed one.
 
      This also closes a related gap: a SKU that's been out of stock long enough for its
      own trailing sales windows to go quiet computes `daily_velocity_units = 0` - that
