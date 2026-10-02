@@ -30,33 +30,46 @@ def get_connection():
 
 
 def fetch_daily_revenue(conn, min_date):
-    """Per-SKU, per-day net revenue (GBP, VAT-exclusive), refunds subtracted - same basis
-    as the dashboard's /api/sales-forecast history line (and Sales Summary/Product
-    Breakdown's "net revenue" everywhere else in the app). v_sku_revenue.net_revenue on
-    its own is pre-refund and would train this model on a number that doesn't match what
-    the tab shows it against. min_date bounds how far back to pull (e.g. 2 years) -
-    required, not optional, since an unbounded pull only grows more expensive over time."""
+    """Per-SKU, per-COUNTRY, per-day net revenue (GBP, VAT-exclusive), refunds subtracted -
+    same basis as the dashboard's /api/sales-forecast history line (and Sales Summary/
+    Product Breakdown's "net revenue" everywhere else in the app). v_sku_revenue.
+    net_revenue on its own is pre-refund and would train this model on a number that
+    doesn't match what the tab shows it against. min_date bounds how far back to pull
+    (e.g. 2 years) - required, not optional, since an unbounded pull only grows more
+    expensive over time.
+
+    country is v_sku_revenue.shipping_country (unified across Amazon/Shopify - see the
+    view), COALESCEd to 'UNKNOWN' rather than left null: a composite GROUP BY/JOIN key
+    with a null in it behaves surprisingly (NULL <> NULL), and a SKU whose country simply
+    wasn't captured by the sync shouldn't silently drop out of the forecast - it still
+    gets its own real, independently-forecast group, just an honestly-labeled one. Refunds
+    are matched to revenue on (sku, country, date) - a refund_date row with no matching
+    rev row (or vice versa) still needs a country to join on, same COALESCE/'UNKNOWN'
+    treatment applied to both sides before the join so the FULL OUTER JOIN doesn't need a
+    separate null-country branch."""
     sql = """
         WITH rev AS (
-          SELECT sku, order_date::date AS date,
+          SELECT sku, COALESCE(shipping_country, 'UNKNOWN') AS country, order_date::date AS date,
             SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue,
             SUM(quantity)::int AS units
           FROM v_sku_revenue
           WHERE sku IS NOT NULL AND order_date::date >= %(min_date)s
-          GROUP BY sku, order_date::date
+          GROUP BY sku, 2, order_date::date
         ),
         ref AS (
-          SELECT sku, refund_date::date AS date,
+          SELECT sku, COALESCE(shipping_country, 'UNKNOWN') AS country, refund_date::date AS date,
             SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
           FROM v_refunds_by_date
           WHERE sku IS NOT NULL AND refund_date::date >= %(min_date)s
-          GROUP BY sku, refund_date::date
+          GROUP BY sku, 2, refund_date::date
         )
-        SELECT COALESCE(rev.sku, ref.sku) AS sku, COALESCE(rev.date, ref.date) AS date,
+        SELECT COALESCE(rev.sku, ref.sku) AS sku, COALESCE(rev.country, ref.country) AS country,
+          COALESCE(rev.date, ref.date) AS date,
           (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue,
           COALESCE(rev.units, 0) AS units
-        FROM rev FULL OUTER JOIN ref ON ref.sku = rev.sku AND ref.date = rev.date
-        ORDER BY 1, 2
+        FROM rev FULL OUTER JOIN ref
+          ON ref.sku = rev.sku AND ref.country = rev.country AND ref.date = rev.date
+        ORDER BY 1, 2, 3
     """
     return pd.read_sql(sql, conn, params={"min_date": min_date})
 
@@ -158,46 +171,56 @@ def fetch_procurement_lead_days(conn):
 
 
 def write_forecast(conn, rows):
-    """rows: list of dicts with sku, forecast_date, forecast_revenue, low_revenue,
-    high_revenue, stage_used, model_used. Replaces this run's horizon per SKU rather than
-    appending, so a re-run doesn't leave stale rows behind an now-shorter forecast."""
+    """rows: list of dicts with sku, country, forecast_date, forecast_revenue, low_revenue,
+    high_revenue, stage_used, model_used. Replaces this run's horizon per (sku, country)
+    pair rather than appending, so a re-run doesn't leave stale rows behind a now-shorter
+    forecast. Deletes by (sku, country) pair, not just sku, so re-running a forecast for
+    one country never wipes out another country's rows for the same SKU."""
     if not rows:
         return
-    skus = list({r["sku"] for r in rows})
+    pairs = list({(r["sku"], r["country"]) for r in rows})
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM sales_forecast WHERE sku = ANY(%s)", (skus,))
+        psycopg2.extras.execute_values(
+            cur,
+            "DELETE FROM sales_forecast WHERE (sku, country) IN (VALUES %s)",
+            pairs,
+        )
         psycopg2.extras.execute_values(
             cur,
             """INSERT INTO sales_forecast
-               (sku, forecast_date, forecast_revenue, low_revenue, high_revenue, stage_used, model_used, generated_at)
+               (sku, country, forecast_date, forecast_revenue, low_revenue, high_revenue, stage_used, model_used, generated_at)
                VALUES %s""",
-            [(r["sku"], r["forecast_date"], r["forecast_revenue"], r["low_revenue"], r["high_revenue"],
+            [(r["sku"], r["country"], r["forecast_date"], r["forecast_revenue"], r["low_revenue"], r["high_revenue"],
               r["stage_used"], r["model_used"], r["generated_at"]) for r in rows],
         )
     conn.commit()
 
 
 def write_exclusions(conn, rows):
-    """rows: list of dicts with sku, excluded_date, reason. Same replace-per-SKU approach
-    as write_forecast - an outlier that drops out of the rolling detection window on a
-    later run shouldn't stay flagged forever.
+    """rows: list of dicts with sku, country, excluded_date, reason. Same replace-per-
+    (sku, country) approach as write_forecast - an outlier that drops out of the rolling
+    detection window on a later run shouldn't stay flagged forever.
 
-    De-dupes on (sku, excluded_date) before inserting, keeping the first reason seen -
-    sales_forecast_exclusions has that as its primary key, so any caller-side collision
-    (forecast.py already guards against the one known way this could happen) would
-    otherwise fail the bulk insert and abort the whole run rather than just this row."""
+    De-dupes on (sku, country, excluded_date) before inserting, keeping the first reason
+    seen - sales_forecast_exclusions has that as its primary key, so any caller-side
+    collision (forecast.py already guards against the one known way this could happen)
+    would otherwise fail the bulk insert and abort the whole run rather than just this row."""
     if not rows:
         return
     seen = {}
     for r in rows:
-        seen.setdefault((r["sku"], r["excluded_date"]), r)
+        seen.setdefault((r["sku"], r["country"], r["excluded_date"]), r)
     deduped = list(seen.values())
-    skus = list({r["sku"] for r in deduped})
+    pairs = list({(r["sku"], r["country"]) for r in deduped})
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM sales_forecast_exclusions WHERE sku = ANY(%s)", (skus,))
         psycopg2.extras.execute_values(
             cur,
-            "INSERT INTO sales_forecast_exclusions (sku, excluded_date, reason) VALUES %s",
-            [(r["sku"], r["excluded_date"], r["reason"]) for r in deduped],
+            "DELETE FROM sales_forecast_exclusions WHERE (sku, country) IN (VALUES %s)",
+            pairs,
+        )
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO sales_forecast_exclusions (sku, country, excluded_date, reason) VALUES %s",
+            [(r["sku"], r["country"], r["excluded_date"], r["reason"]) for r in deduped],
         )
     conn.commit()
