@@ -121,23 +121,31 @@ def build_pending_by_sku(pending_df):
     return out
 
 
-def apply_out_of_stock_fallback(sellable, pending, lead_days):
-    """A SKU that's out of stock (sellable <= 0) with no real shipment in the pipeline
-    yet (`pending` empty) would otherwise forecast as stocked out for the ENTIRE horizon,
-    forever, since compute_supply_ratio has nothing telling it when supply resumes - which
-    reads as "will never sell again," not the intended "will sell again once reordered."
-    Rather than guess a quantity (there's no real PO to base one on), this assumes FULL
-    demand resumes at the SKU's configured procurement lead time (Settings ->
-    Procurement) - "if we ordered today, it'd take this long" - by injecting a single
-    fallback pending entry with an effectively unlimited quantity at that day, reusing
-    compute_supply_ratio's own simulation rather than a separate code path. Returns
-    `pending` unchanged whenever it doesn't apply (already has a real shipment, is
-    actually in stock, or has no configured lead time to assume one from - in that last
-    case there's genuinely no basis for a resume date, so the SKU correctly stays
-    stocked-out for the full horizon rather than silently guessing one)."""
-    if sellable > 0 or pending or not lead_days or lead_days <= 0:
+def apply_replenishment_assumption(sellable, daily_velocity_units, pending, lead_days, horizon):
+    """The default is to ASSUME ONGOING REPLENISHMENT, not to project a future stock-out
+    from current stock alone (see compute_supply_ratio's own docstring) - this function's
+    only job is deciding the one case that default doesn't cover on its own: real data
+    (current stock + whatever's actually in the pipeline) showing a stock-out with
+    NOTHING currently known to resolve it (fc.find_unresolved_depletion_day). There, a
+    hypothetical reorder is assumed to land `lead_days` AFTER the real depletion day -
+    not from today - modeling the business reordering as stock actually runs low (the
+    normal course of things), the same way a real shipment's own arrival would have been
+    anchored had one existed. Rather than guess a quantity (there's no real PO to base one
+    on), this assumes FULL demand resumes from that point by injecting a single fallback
+    pending entry with an effectively unlimited quantity, reusing compute_supply_ratio's
+    own simulation rather than a separate code path.
+
+    Returns `pending` unchanged whenever nothing is actually projected to run out
+    unresolved (the common case - ample current stock with no open shipment needs
+    nothing assumed about it at all), or when there's no configured lead time to assume a
+    recovery date from (genuinely nothing to base one on - the SKU then correctly stays
+    reflecting the real, unresolved gap instead of a guessed one)."""
+    if not lead_days or lead_days <= 0:
         return pending
-    return [(lead_days, float("inf"))]
+    depletion_day = fc.find_unresolved_depletion_day(sellable, daily_velocity_units, pending, horizon)
+    if depletion_day is None:
+        return pending
+    return pending + [(depletion_day + lead_days, float("inf"))]
 
 
 def run(conn):
@@ -179,9 +187,11 @@ def run(conn):
         pending = pending_by_sku.get(sku, [])
         if not is_eol:
             # EOL deliberately never gets this (or any pending shipment) - see
-            # apply_out_of_stock_fallback's and run_for_sku's own docstrings for why.
-            pending = apply_out_of_stock_fallback(
-                base["sellable"] if base else 0, pending, lead_days_by_sku.get(sku),
+            # apply_replenishment_assumption's and run_for_sku's own docstrings for why.
+            pending = apply_replenishment_assumption(
+                base["sellable"] if base else 0,
+                base["daily_velocity_units"] if base else 0,
+                pending, lead_days_by_sku.get(sku), HORIZON_DAYS,
             )
         supply_inputs = {**base, "pending": pending} if base else None
 

@@ -426,13 +426,27 @@ def compute_supply_ratio(sellable, daily_velocity_units, pending, horizon):
     later day (a customer who couldn't buy today isn't assumed to buy double tomorrow, so
     a bad supply gap is a real lost-sales dip, not just a deferred one).
 
+    DEFAULT IS UNCONSTRAINED: `sellable > 0` and `pending` empty returns ratio=1.0 for the
+    whole horizon, with no simulation at all - ongoing replenishment is ASSUMED
+    indefinitely, not something this only trusts up to whatever's already been placed.
+    The alternative - simulating current stock run down by velocity with no future
+    reorders ever assumed - would eventually (and wrongly) flag almost every actively-
+    selling SKU as running out somewhere within a long enough horizon, just because
+    nothing's been ordered YET (there's no need to yet). This function only ever
+    constrains when there's something concrete to react to: a shipment already in the
+    pipeline (real arrival data, whether or not it turns out to be enough on its own), or
+    genuinely zero stock on hand today. See pipeline.find_unresolved_depletion_day /
+    apply_replenishment_assumption for how a SKU that LEGITIMATELY runs dry (current stock
+    insufficient and no real shipment covers the gap) still gets a assumed-lead-time
+    recovery folded into `pending` before it ever reaches this function - this function
+    itself never invents a future problem on its own.
+
     `pending`: list of (arrival_day_offset, qty) pairs - units NOT yet in `sellable`,
     expected to become sellable on the given day-out-from-today (0 = today). Callers
-    derive this from in-transit inbound shipments, OR, when a SKU is out of stock with no
-    real shipment in the pipeline at all, a single assumed entry at the SKU's configured
-    procurement lead time (see pipeline.py's build_pending_by_sku and
-    apply_out_of_stock_fallback) - units already received must already be counted in
-    `sellable` and must NOT also appear here, or they'd be double-counted.
+    derive this from in-transit inbound shipments, and/or a single assumed entry at the
+    SKU's configured procurement lead time when real data runs out with nothing covering
+    it (see pipeline.py) - units already received must already be counted in `sellable`
+    and must NOT also appear here, or they'd be double-counted.
 
     Unlike the end-of-life cutoff below, this never permanently zeroes a SKU out: once
     enough pending stock arrives to clear a shortfall, the ratio returns to 1.0 and the
@@ -445,23 +459,26 @@ def compute_supply_ratio(sellable, daily_velocity_units, pending, horizon):
     units on hand means zero revenue is certain regardless of what the demand estimate
     says, so that combination still gates to 0 until the first pending arrival (full
     coverage resumes from there - with no demand figure to compute a partial ratio
-    against, this can't scale a gradual recovery the way the velocity>0 path below does).
-    `daily_velocity_units <= 0` WITH `sellable > 0` has nothing to constrain (there's
-    stock, and no measurable demand to run out of it) and returns unconstrained."""
+    against, this can't scale a gradual recovery the way the velocity>0 path below does)."""
+    sellable = float(sellable)
+    if sellable > 0 and not pending:
+        return np.ones(horizon)
+
     pending_sorted = sorted(pending, key=lambda p: p[0])
     ratio = np.ones(horizon)
-    available = float(sellable)
+    available = sellable
+    idx = 0
     if daily_velocity_units <= 0:
-        if available > 0:
-            return ratio
-        idx = 0
+        # No measurable demand, but there IS something concrete here (zero stock, and/or
+        # a real shipment) - nothing to scale a partial ratio against, so this is simply
+        # "do we have any stock at all today" rather than the velocity-driven simulation
+        # below.
         for d in range(horizon):
             while idx < len(pending_sorted) and pending_sorted[idx][0] <= d:
                 available += pending_sorted[idx][1]
                 idx += 1
             ratio[d] = 0.0 if available <= 0 else 1.0
         return ratio
-    idx = 0
     for d in range(horizon):
         while idx < len(pending_sorted) and pending_sorted[idx][0] <= d:
             available += pending_sorted[idx][1]
@@ -470,6 +487,42 @@ def compute_supply_ratio(sellable, daily_velocity_units, pending, horizon):
         ratio[d] = sellable_today / daily_velocity_units
         available -= sellable_today
     return ratio
+
+
+def find_unresolved_depletion_day(sellable, daily_velocity_units, pending, horizon):
+    """Simulates `sellable`/`pending` (REAL data only - never include an assumed
+    lead-time fallback here, that's what this function itself helps decide whether to
+    add) day by day and returns the first day stock is fully depleted with nothing
+    FURTHER in `pending` scheduled to arrive afterward - i.e. a stock-out that nothing
+    currently known resolves. Returns None when that never happens: stock stays positive
+    throughout (nothing to react to - matches compute_supply_ratio's own "assume ongoing
+    replenishment by default" gate, checked first below), or it does run dry at some
+    point but a LATER real pending arrival is already known to cover it (that's a real,
+    temporary, already-resolved gap - compute_supply_ratio models it correctly on its
+    own, and pipeline.apply_replenishment_assumption should leave it alone rather than
+    manufacture an assumption on top of data that already answers the question).
+
+    Used only to decide where to anchor a HYPOTHETICAL future reorder (see
+    apply_replenishment_assumption) - this function itself never assumes one; it only
+    ever reports what the real, already-known data implies."""
+    sellable = float(sellable)
+    if sellable > 0 and not pending:
+        return None
+    pending_sorted = sorted(pending, key=lambda p: p[0])
+    last_arrival_day = pending_sorted[-1][0] if pending_sorted else -1
+    available = sellable
+    idx = 0
+    for d in range(horizon):
+        while idx < len(pending_sorted) and pending_sorted[idx][0] <= d:
+            available += pending_sorted[idx][1]
+            idx += 1
+        if available <= 0 and d >= last_arrival_day:
+            return d
+        if daily_velocity_units <= 0:
+            continue  # nothing measurable to consume - available only moves via arrivals
+        sellable_today = min(daily_velocity_units, max(available, 0.0))
+        available -= sellable_today
+    return None
 
 
 def run_for_sku(sku, hist_df, today, stage_override, is_end_of_life, supply_inputs, horizon=90, catalog_index=None):
